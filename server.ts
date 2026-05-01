@@ -7,6 +7,9 @@
  * ~/.claude/channels/telegram/access.json — managed by the /telegram:access skill.
  *
  * Telegram's Bot API has no history or search. Reply-only tools.
+ *
+ * Fork additions (brody-telegram-plugin):
+ *   - Feature 1: Topics support (Bot API 9.4) — message_thread_id in/out, create_forum_topic tool
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -397,7 +400,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has a message_thread_id attribute, the message is in a forum topic — pass message_thread_id back to reply to stay in that topic. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -447,7 +450,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, message_thread_id for forum topic routing, and files (absolute paths) to attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -456,6 +459,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           reply_to: {
             type: 'string',
             description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
+          },
+          message_thread_id: {
+            type: 'number',
+            description: 'Forum topic ID. Pass this when the inbound message has a message_thread_id attribute to keep replies in the same topic.',
           },
           files: {
             type: 'array',
@@ -513,6 +520,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'message_id', 'text'],
       },
     },
+    // Feature 1: forum topic management
+    {
+      name: 'create_forum_topic',
+      description: 'Create a new topic in a Telegram forum/supergroup chat. Requires the chat to have topics enabled (BotFather: /setbottopics). Returns the new topic\'s message_thread_id for use in reply\'s message_thread_id parameter.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'The supergroup chat ID (must have topics enabled)' },
+          name: { type: 'string', description: 'Topic name (1-128 characters)' },
+        },
+        required: ['chat_id', 'name'],
+      },
+    },
   ],
 }))
 
@@ -524,6 +544,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+        // Feature 1: forum topic routing
+        const message_thread_id = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
@@ -554,6 +576,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
+              ...(message_thread_id != null ? { message_thread_id } : {}),
             })
             sentIds.push(sent.message_id)
           }
@@ -565,18 +588,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
-        // sendMessage call). Thread under reply_to if present.
+        // sendMessage call). Thread under reply_to and/or topic if present.
         for (const f of files) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
+          const opts = {
+            ...(reply_to != null && replyMode !== 'off'
+              ? { reply_parameters: { message_id: reply_to } }
+              : {}),
+            ...(message_thread_id != null ? { message_thread_id } : {}),
+          }
           if (PHOTO_EXTS.has(ext)) {
-            const sent = await bot.api.sendPhoto(chat_id, input, opts)
+            const sent = await bot.api.sendPhoto(chat_id, input, Object.keys(opts).length ? opts : undefined)
             sentIds.push(sent.message_id)
           } else {
-            const sent = await bot.api.sendDocument(chat_id, input, opts)
+            const sent = await bot.api.sendDocument(chat_id, input, Object.keys(opts).length ? opts : undefined)
             sentIds.push(sent.message_id)
           }
         }
@@ -624,6 +650,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         )
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
+      }
+      case 'create_forum_topic': {
+        // Feature 1: create a new forum topic in a supergroup with topics enabled.
+        assertAllowedChat(args.chat_id as string)
+        const topic = await bot.api.createForumTopic(
+          args.chat_id as string,
+          args.name as string,
+        )
+        return {
+          content: [{
+            type: 'text',
+            text: `created topic "${topic.name}" (message_thread_id: ${topic.message_thread_id})`,
+          }],
+        }
       }
       default:
         return {
@@ -919,6 +959,8 @@ async function handleInbound(
   const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
+  // Feature 1: capture message_thread_id for forum topic routing.
+  const threadId = ctx.message?.message_thread_id
 
   // Permission-reply intercept: if this looks like "yes xxxxx" for a
   // pending permission request, emit the structured event instead of
@@ -967,6 +1009,8 @@ async function handleInbound(
       meta: {
         chat_id,
         ...(msgId != null ? { message_id: String(msgId) } : {}),
+        // Feature 1: include thread ID when present so Claude can echo it back.
+        ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
         user: from.username ?? String(from.id),
         user_id: String(from.id),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
