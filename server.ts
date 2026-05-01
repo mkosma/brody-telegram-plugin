@@ -10,6 +10,7 @@
  *
  * Fork additions (brody-telegram-plugin):
  *   - Feature 1: Topics support (Bot API 9.4) — message_thread_id in/out, create_forum_topic tool
+ *   - Feature 2: Reactions support — message_reaction events surfaced as channel blocks
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -403,6 +404,8 @@ const mcp = new Server(
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has a message_thread_id attribute, the message is in a forum topic — pass message_thread_id back to reply to stay in that topic. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+      '',
+      'Reaction events arrive as <channel source="telegram" type="reaction" chat_id="..." message_id="..." user="..." reaction="..." action="added|removed" ts="..."/>. A reaction on a message is a lightweight confirmation signal — treat 👍 as "yes/proceed", 👎 as "no/cancel" unless context suggests otherwise.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -824,6 +827,58 @@ bot.on('callback_query:data', async ctx => {
   }
 })
 
+// Feature 2: Reactions — surface as channel events so Claude can treat 👍/👎
+// as lightweight confirmations without requiring the user to type.
+bot.on('message_reaction', async ctx => {
+  const reaction = ctx.messageReaction
+  if (!reaction) return
+
+  const access = loadAccess()
+  const userId = String(reaction.user?.id ?? reaction.actor_chat?.id ?? '')
+  if (!userId) return
+
+  // Only deliver for allowlisted users.
+  if (!access.allowFrom.includes(userId)) return
+
+  const chat_id = String(reaction.chat.id)
+  const msgId = reaction.message_id
+
+  // Determine what changed: compare old vs new reaction lists.
+  // new_reaction contains the full current set; old_reaction the previous set.
+  // We surface each changed emoji individually as an add or remove.
+  const oldSet = new Set((reaction.old_reaction ?? []).map(r => r.type === 'emoji' ? r.emoji : `[${r.type}]`))
+  const newSet = new Set((reaction.new_reaction ?? []).map(r => r.type === 'emoji' ? r.emoji : `[${r.type}]`))
+
+  const added = [...newSet].filter(e => !oldSet.has(e))
+  const removed = [...oldSet].filter(e => !newSet.has(e))
+
+  const events = [
+    ...added.map(emoji => ({ emoji, action: 'added' })),
+    ...removed.map(emoji => ({ emoji, action: 'removed' })),
+  ]
+
+  for (const { emoji, action } of events) {
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: `[reaction ${action}: ${emoji}]`,
+        meta: {
+          type: 'reaction',
+          chat_id,
+          message_id: String(msgId),
+          reaction: emoji,
+          action,
+          user: reaction.user?.username ?? userId,
+          user_id: userId,
+          ts: new Date((reaction.date ?? 0) * 1000).toISOString(),
+        },
+      },
+    }).catch(err => {
+      process.stderr.write(`telegram channel: failed to deliver reaction to Claude: ${err}\n`)
+    })
+  }
+})
+
 bot.on('message:text', async ctx => {
   await handleInbound(ctx, ctx.message.text, undefined)
 })
@@ -1044,6 +1099,14 @@ void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
+        // Feature 2: add message_reaction (and message_reaction_count) to
+        // allowed_updates so Telegram delivers reaction events via getUpdates.
+        allowed_updates: [
+          'message',
+          'callback_query',
+          'message_reaction',
+          'message_reaction_count',
+        ],
         onStart: info => {
           attempt = 0
           botUsername = info.username
