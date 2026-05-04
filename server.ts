@@ -872,6 +872,29 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
+  // Plugin-side open-doc handler: callback_data of the form open:<vault>:<path>
+  // fires obsidian-cli on mbp directly. Does NOT round-trip through Claude,
+  // so it works whether or not a Brody session is alive and attentive.
+  // Allowlist-gated like the rest of the callback path.
+  const openMatch = /^open:([^:]+):(.+)$/.exec(data)
+  if (openMatch) {
+    const accessOpen = loadAccess()
+    const senderIdOpen = String(ctx.from.id)
+    if (!accessOpen.allowFrom.includes(senderIdOpen)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const [, vault, path] = openMatch
+    const { exec } = await import('node:child_process')
+    const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
+    const cmd = `ssh monty@mbp.local "/usr/local/bin/obsidian open path=${sq(path)} vault=${sq(vault)}"`
+    exec(cmd, { timeout: 8000 }, (err) => {
+      if (err) process.stderr.write(`open-callback ssh failed: ${err.message}\n`)
+    })
+    await ctx.answerCallbackQuery({ text: `Opening ${path.split('/').pop()}` }).catch(() => {})
+    return
+  }
+
   // Feature 3: General inline keyboard callback — surface to Claude as a channel event.
   // Acknowledge the tap immediately so Telegram removes the "loading" spinner.
   await ctx.answerCallbackQuery().catch(() => {})
