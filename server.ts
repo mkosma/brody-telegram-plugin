@@ -884,7 +884,9 @@ bot.on('callback_query:data', async ctx => {
       await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
       return
     }
-    const [, vault, path] = openMatch
+    const [, vault, rawPath] = openMatch
+    // Append .md if no extension present; obsidian-cli does not auto-resolve.
+    const path = /\.[a-z0-9]{2,5}$/i.test(rawPath) ? rawPath : `${rawPath}.md`
     const { exec } = await import('node:child_process')
     const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
     const cmd = `ssh monty@mbp.local "/usr/local/bin/obsidian open path=${sq(path)} vault=${sq(vault)}"`
