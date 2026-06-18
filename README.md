@@ -1,8 +1,10 @@
-# Telegram
+# Telegram (brody fork)
 
 Connect a Telegram bot to your Claude Code with an MCP server.
 
 The MCP server logs into Telegram as a bot and provides tools to Claude to reply, react, or edit messages. When you message the bot, the server forwards the message to your Claude Code session.
+
+> This is a fork of the official `claude-plugins-official` Telegram plugin. It adds forum-topic support (`create_forum_topic` + `message_thread_id`), inline keyboard buttons, expanded `callback_query` surfacing, an `open:` callback handler that opens vault notes, and a `download_attachment` tool. See the fork rationale and load-mechanism decision in `monty-ops/telegram/telegram-plugin-fork-plan.md`. The exact plugin/channel name used to launch depends on how this fork is installed (see step 4).
 
 ## Prerequisites
 
@@ -22,13 +24,15 @@ BotFather replies with a token that looks like `123456789:AAHfiqksKZ8...` — th
 
 **2. Install the plugin.**
 
-These are Claude Code commands — run `claude` to start a session first.
+These are Claude Code commands - run `claude` to start a session first.
 
-Install the plugin:
+Install the upstream plugin (the fork shadows it locally; the marketplace copy is left untouched):
 ```
 /plugin install telegram@claude-plugins-official
 /reload-plugins
 ```
+
+To run this fork instead of the marketplace copy, point Claude Code at this directory rather than re-installing. The two supported mechanisms (a `~/.claude/settings.json` plugin-path override, or a launch-command override) are described in `monty-ops/telegram/telegram-plugin-fork-plan.md`. Keep the bot token out of this repo: it lives in `~/.claude/channels/telegram/.env`.
 
 **3. Give the server the token.**
 
@@ -42,11 +46,13 @@ Writes `TELEGRAM_BOT_TOKEN=...` to `~/.claude/channels/telegram/.env`. You can a
 
 **4. Relaunch with the channel flag.**
 
-The server won't connect without this — exit your session and start a new one:
+The server won't connect without this. A plain `claude` session gets the bot's outbound tools but NOT the inbound notification-to-turn listener: messages are silently dropped. You must relaunch with `--channels`. Exit your session and start a new one:
 
 ```sh
 claude --channels plugin:telegram@claude-plugins-official
 ```
+
+That command loads the marketplace copy. To launch this fork, substitute the plugin/channel name the fork is installed under per step 2 (for the dev `.mcp.json` path the form is `--dangerously-load-development-channels server:telegram`, which the auto-mode classifier blocks without explicit authorization). The fleet's working launcher uses `claude --channels plugin:telegram@claude-plugins-official` in tmux (see `monty-ops/sre/watchdog.sh`).
 
 **5. Pair.**
 
@@ -76,9 +82,13 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 | --- | --- |
 | `reply` | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for native threading and `files` (absolute paths) for attachments. Images (`.jpg`/`.png`/`.gif`/`.webp`) send as photos with inline preview; other types send as documents. Max 50MB each. Auto-chunks text; files send as separate messages after the text. Returns the sent message ID(s). |
 | `react` | Add an emoji reaction to a message by ID. **Only Telegram's fixed whitelist** is accepted (👍 👎 ❤ 🔥 👀 etc). |
-| `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
+| `edit_message` | Edit a message the bot previously sent. Useful for "working…" to result progress updates. Only works on the bot's own messages. |
+| `download_attachment` | (fork addition) Fetch a file by `file_id` from an inbound message and return its local path so the assistant can `Read` it. |
+| `create_forum_topic` | (fork addition) Create a forum topic in a supergroup (Bot API 9.4) and return its `message_thread_id`, so replies can be threaded into topics. |
 
-Inbound messages trigger a typing indicator automatically — Telegram shows
+Replies can also carry inline keyboard buttons (`reply_markup` with an `inline_keyboard` array); button taps arrive as `callback_query` events. The fork handles `open:<vault>:<path>` callbacks to open vault notes.
+
+Inbound messages trigger a typing indicator automatically - Telegram shows
 "botname is typing…" while the assistant works on a response.
 
 ## Photos
@@ -91,9 +101,9 @@ as a document instead (long-press → Send as File).
 ## No history or search
 
 Telegram's Bot API exposes **neither** message history nor search. The bot
-only sees messages as they arrive — no `fetch_messages` tool exists. If the
+only sees messages as they arrive - no `fetch_messages` tool exists. If the
 assistant needs earlier context, it will ask you to paste or summarize.
 
-This also means there's no `download_attachment` tool for historical messages
-— photos are downloaded eagerly on arrival since there's no way to fetch them
-later.
+Photos are still downloaded eagerly on arrival (there is no way to fetch a
+historical message later). The fork's `download_attachment` tool fetches
+non-photo attachments by `file_id` from the inbound message as it arrives.
