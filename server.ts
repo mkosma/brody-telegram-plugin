@@ -91,6 +91,36 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const bot = new Bot(TOKEN)
 let botUsername = ''
 
+// --- Typing keepalive ----------------------------------------------------
+// Telegram's "typing…" indicator (sendChatAction) auto-expires after ~5s, so a
+// single ping on inbound vanishes long before a real reply (tool calls, model
+// latency) is composed. We instead hold it: re-send 'typing' every TYPING_EVERY
+// ms from the moment a message arrives until the reply tool fires for that chat
+// (or a safety cap), so the sender sees a live "is composing" signal for the
+// whole turn. Scoped per chat_id and ONLY between inbound and reply, so it never
+// shows during autonomous/background work (which has no inbound to start it).
+const TYPING_EVERY_MS = 4_000
+const TYPING_MAX_MS = 4 * 60_000
+const typingTimers = new Map<string, { interval: ReturnType<typeof setInterval>; cap: ReturnType<typeof setTimeout> }>()
+
+function startTyping(chat_id: string): void {
+  stopTyping(chat_id) // never stack two loops on one chat
+  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  const interval = setInterval(() => {
+    void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  }, TYPING_EVERY_MS)
+  const cap = setTimeout(() => stopTyping(chat_id), TYPING_MAX_MS)
+  typingTimers.set(chat_id, { interval, cap })
+}
+
+function stopTyping(chat_id: string): void {
+  const t = typingTimers.get(chat_id)
+  if (!t) return
+  clearInterval(t.interval)
+  clearTimeout(t.cap)
+  typingTimers.delete(chat_id)
+}
+
 type PendingEntry = {
   senderId: string
   chatId: string
@@ -580,6 +610,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const reply_markup = args.reply_markup as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } | undefined
 
         assertAllowedChat(chat_id)
+        // The reply is going out now — stop the "is composing" typing keepalive.
+        stopTyping(chat_id)
 
         for (const f of files) {
           assertSendable(f)
@@ -1140,8 +1172,9 @@ async function handleInbound(
     return
   }
 
-  // Typing indicator — signals "processing" until we reply (or ~5s elapses).
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  // Typing indicator — held alive until the reply tool fires for this chat (see
+  // startTyping). Signals "is composing" for the whole turn, not just ~5s.
+  startTyping(chat_id)
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
