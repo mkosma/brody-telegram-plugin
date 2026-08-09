@@ -7,6 +7,11 @@
  * ~/.claude/channels/telegram/access.json — managed by the /telegram:access skill.
  *
  * Telegram's Bot API has no history or search. Reply-only tools.
+ *
+ * Fork additions (brody-telegram-plugin):
+ *   - Feature 1: Topics support (Bot API 9.4) — message_thread_id in/out, create_forum_topic tool
+ *   - Feature 2: Reactions support — message_reaction events surfaced as channel blocks
+ *   - Feature 3: Inline keyboards — reply_markup on outbound, callback_query events for general use
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -397,9 +402,13 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has a message_thread_id attribute, the message is in a forum topic — pass message_thread_id back to reply to stay in that topic. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+      '',
+      'Reaction events arrive as <channel source="telegram" type="reaction" chat_id="..." message_id="..." user="..." reaction="..." action="added|removed" ts="..."/>. A reaction on a message is a lightweight confirmation signal — treat 👍 as "yes/proceed", 👎 as "no/cancel" unless context suggests otherwise.',
+      '',
+      'To attach inline keyboard buttons to an outbound message, pass reply_markup with an inline_keyboard array. Each button needs text (label) and callback_data (a short string you choose). When Monty taps a button, a callback_query event arrives as <channel source="telegram" type="callback_query" chat_id="..." message_id="..." callback_data="..." user="..." ts="..."/>.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -447,7 +456,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, message_thread_id for forum topic routing, reply_markup for inline keyboard buttons, and files (absolute paths) to attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -456,6 +465,31 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           reply_to: {
             type: 'string',
             description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
+          },
+          message_thread_id: {
+            type: 'number',
+            description: 'Forum topic ID. Pass this when the inbound message has a message_thread_id attribute to keep replies in the same topic.',
+          },
+          reply_markup: {
+            type: 'object',
+            description: 'Inline keyboard to attach. Pass an inline_keyboard array of button rows. Each button needs text (label) and callback_data (short identifier string, max 64 bytes). When the user taps a button a callback_query event arrives as a channel block.',
+            properties: {
+              inline_keyboard: {
+                type: 'array',
+                items: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      text: { type: 'string', description: 'Button label' },
+                      callback_data: { type: 'string', description: 'Data sent back when tapped (max 64 bytes)' },
+                    },
+                    required: ['text', 'callback_data'],
+                  },
+                },
+              },
+            },
+            required: ['inline_keyboard'],
           },
           files: {
             type: 'array',
@@ -513,6 +547,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'message_id', 'text'],
       },
     },
+    // Feature 1: forum topic management
+    {
+      name: 'create_forum_topic',
+      description: 'Create a new topic in a Telegram forum/supergroup chat. Requires the chat to have topics enabled (BotFather: /setbottopics). Returns the new topic\'s message_thread_id for use in reply\'s message_thread_id parameter.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'The supergroup chat ID (must have topics enabled)' },
+          name: { type: 'string', description: 'Topic name (1-128 characters)' },
+        },
+        required: ['chat_id', 'name'],
+      },
+    },
   ],
 }))
 
@@ -524,9 +571,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+        // Feature 1: forum topic routing
+        const message_thread_id = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        // Feature 3: inline keyboard
+        const reply_markup = args.reply_markup as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } | undefined
 
         assertAllowedChat(chat_id)
 
@@ -545,15 +596,35 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
 
+        // Feature 3: build an InlineKeyboard from reply_markup if provided.
+        // Only attach to the first chunk; subsequent chunks are overflow text.
+        let grammyKeyboard: InlineKeyboard | undefined
+        if (reply_markup?.inline_keyboard) {
+          grammyKeyboard = new InlineKeyboard()
+          for (let rowIdx = 0; rowIdx < reply_markup.inline_keyboard.length; rowIdx++) {
+            const row = reply_markup.inline_keyboard[rowIdx]
+            for (const btn of row) {
+              grammyKeyboard.text(btn.text, btn.callback_data)
+            }
+            if (rowIdx < reply_markup.inline_keyboard.length - 1) {
+              grammyKeyboard.row()
+            }
+          }
+        }
+
         try {
           for (let i = 0; i < chunks.length; i++) {
             const shouldReplyTo =
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
+            // Attach keyboard only to the first (or only) chunk.
+            const chunkKeyboard = i === 0 ? grammyKeyboard : undefined
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
+              ...(message_thread_id != null ? { message_thread_id } : {}),
+              ...(chunkKeyboard ? { reply_markup: chunkKeyboard } : {}),
             })
             sentIds.push(sent.message_id)
           }
@@ -565,18 +636,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
-        // sendMessage call). Thread under reply_to if present.
+        // sendMessage call). Thread under reply_to and/or topic if present.
         for (const f of files) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
+          const opts = {
+            ...(reply_to != null && replyMode !== 'off'
+              ? { reply_parameters: { message_id: reply_to } }
+              : {}),
+            ...(message_thread_id != null ? { message_thread_id } : {}),
+          }
           if (PHOTO_EXTS.has(ext)) {
-            const sent = await bot.api.sendPhoto(chat_id, input, opts)
+            const sent = await bot.api.sendPhoto(chat_id, input, Object.keys(opts).length ? opts : undefined)
             sentIds.push(sent.message_id)
           } else {
-            const sent = await bot.api.sendDocument(chat_id, input, opts)
+            const sent = await bot.api.sendDocument(chat_id, input, Object.keys(opts).length ? opts : undefined)
             sentIds.push(sent.message_id)
           }
         }
@@ -624,6 +698,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         )
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
+      }
+      case 'create_forum_topic': {
+        // Feature 1: create a new forum topic in a supergroup with topics enabled.
+        assertAllowedChat(args.chat_id as string)
+        const topic = await bot.api.createForumTopic(
+          args.chat_id as string,
+          args.name as string,
+        )
+        return {
+          content: [{
+            type: 'text',
+            text: `created topic "${topic.name}" (message_thread_id: ${topic.message_thread_id})`,
+          }],
+        }
       }
       default:
         return {
@@ -725,62 +813,170 @@ bot.command('status', async ctx => {
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
 })
 
-// Inline-button handler for permission requests. Callback data is
-// `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
+// Inline-button handler. Handles two classes of callback data:
+//   perm:allow/deny/more:<id>  — permission relay (internal)
+//   anything else             — Feature 3: surface to Claude as a channel event
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
-  const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
-  if (!m) {
-    await ctx.answerCallbackQuery().catch(() => {})
-    return
-  }
-  const access = loadAccess()
-  const senderId = String(ctx.from.id)
-  if (!access.allowFrom.includes(senderId)) {
-    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
-    return
-  }
-  const [, behavior, request_id] = m
+  const permMatch = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
 
-  if (behavior === 'more') {
-    const details = pendingPermissions.get(request_id)
-    if (!details) {
-      await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {})
+  if (permMatch) {
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
       return
     }
-    const { tool_name, description, input_preview } = details
-    let prettyInput: string
-    try {
-      prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2)
-    } catch {
-      prettyInput = input_preview
+    const [, behavior, request_id] = permMatch
+
+    if (behavior === 'more') {
+      const details = pendingPermissions.get(request_id)
+      if (!details) {
+        await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {})
+        return
+      }
+      const { tool_name, description, input_preview } = details
+      let prettyInput: string
+      try {
+        prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2)
+      } catch {
+        prettyInput = input_preview
+      }
+      const expanded =
+        `🔐 Permission: ${tool_name}\n\n` +
+        `tool_name: ${tool_name}\n` +
+        `description: ${description}\n` +
+        `input_preview:\n${prettyInput}`
+      const keyboard = new InlineKeyboard()
+        .text('✅ Allow', `perm:allow:${request_id}`)
+        .text('❌ Deny', `perm:deny:${request_id}`)
+      await ctx.editMessageText(expanded, { reply_markup: keyboard }).catch(() => {})
+      await ctx.answerCallbackQuery().catch(() => {})
+      return
     }
-    const expanded =
-      `🔐 Permission: ${tool_name}\n\n` +
-      `tool_name: ${tool_name}\n` +
-      `description: ${description}\n` +
-      `input_preview:\n${prettyInput}`
-    const keyboard = new InlineKeyboard()
-      .text('✅ Allow', `perm:allow:${request_id}`)
-      .text('❌ Deny', `perm:deny:${request_id}`)
-    await ctx.editMessageText(expanded, { reply_markup: keyboard }).catch(() => {})
-    await ctx.answerCallbackQuery().catch(() => {})
+
+    void mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: { request_id, behavior },
+    })
+    pendingPermissions.delete(request_id)
+    const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
+    await ctx.answerCallbackQuery({ text: label }).catch(() => {})
+    // Replace buttons with the outcome so the same request can't be answered
+    // twice and the chat history shows what was chosen.
+    const msg = ctx.callbackQuery.message
+    if (msg && 'text' in msg && msg.text) {
+      await ctx.editMessageText(`${msg.text}\n\n${label}`).catch(() => {})
+    }
     return
   }
 
-  void mcp.notification({
-    method: 'notifications/claude/channel/permission',
-    params: { request_id, behavior },
+  // Plugin-side open-doc handler: callback_data of the form open:<vault>:<path>
+  // fires obsidian-cli on mbp directly. Does NOT round-trip through Claude,
+  // so it works whether or not a Brody session is alive and attentive.
+  // Allowlist-gated like the rest of the callback path.
+  const openMatch = /^open:([^:]+):(.+)$/.exec(data)
+  if (openMatch) {
+    const accessOpen = loadAccess()
+    const senderIdOpen = String(ctx.from.id)
+    if (!accessOpen.allowFrom.includes(senderIdOpen)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const [, vault, rawPath] = openMatch
+    // Append .md if no extension present; obsidian-cli does not auto-resolve.
+    const path = /\.[a-z0-9]{2,5}$/i.test(rawPath) ? rawPath : `${rawPath}.md`
+    const { exec } = await import('node:child_process')
+    const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
+    const cmd = `ssh monty@mbp.local "/usr/local/bin/obsidian open path=${sq(path)} vault=${sq(vault)} newtab"`
+    exec(cmd, { timeout: 8000 }, (err) => {
+      if (err) process.stderr.write(`open-callback ssh failed: ${err.message}\n`)
+    })
+    await ctx.answerCallbackQuery({ text: `Opening ${path.split('/').pop()}` }).catch(() => {})
+    return
+  }
+
+  // Feature 3: General inline keyboard callback — surface to Claude as a channel event.
+  // Acknowledge the tap immediately so Telegram removes the "loading" spinner.
+  await ctx.answerCallbackQuery().catch(() => {})
+
+  const access = loadAccess()
+  const senderId = String(ctx.from.id)
+  // Only deliver to allowlisted users (same gate as inbound messages).
+  if (!access.allowFrom.includes(senderId)) return
+
+  const chat_id = ctx.callbackQuery.message ? String(ctx.callbackQuery.message.chat.id) : senderId
+  const origMessageId = ctx.callbackQuery.message?.message_id
+
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: `[button tapped: ${data}]`,
+      meta: {
+        type: 'callback_query',
+        chat_id,
+        callback_data: data,
+        ...(origMessageId != null ? { message_id: String(origMessageId) } : {}),
+        user: ctx.from.username ?? senderId,
+        user_id: senderId,
+        ts: new Date().toISOString(),
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`telegram channel: failed to deliver callback_query to Claude: ${err}\n`)
   })
-  pendingPermissions.delete(request_id)
-  const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
-  await ctx.answerCallbackQuery({ text: label }).catch(() => {})
-  // Replace buttons with the outcome so the same request can't be answered
-  // twice and the chat history shows what was chosen.
-  const msg = ctx.callbackQuery.message
-  if (msg && 'text' in msg && msg.text) {
-    await ctx.editMessageText(`${msg.text}\n\n${label}`).catch(() => {})
+})
+
+// Feature 2: Reactions — surface as channel events so Claude can treat 👍/👎
+// as lightweight confirmations without requiring the user to type.
+bot.on('message_reaction', async ctx => {
+  const reaction = ctx.messageReaction
+  if (!reaction) return
+
+  const access = loadAccess()
+  const userId = String(reaction.user?.id ?? reaction.actor_chat?.id ?? '')
+  if (!userId) return
+
+  // Only deliver for allowlisted users.
+  if (!access.allowFrom.includes(userId)) return
+
+  const chat_id = String(reaction.chat.id)
+  const msgId = reaction.message_id
+
+  // Determine what changed: compare old vs new reaction lists.
+  // new_reaction contains the full current set; old_reaction the previous set.
+  // We surface each changed emoji individually as an add or remove.
+  const oldSet = new Set((reaction.old_reaction ?? []).map(r => r.type === 'emoji' ? r.emoji : `[${r.type}]`))
+  const newSet = new Set((reaction.new_reaction ?? []).map(r => r.type === 'emoji' ? r.emoji : `[${r.type}]`))
+
+  const added = [...newSet].filter(e => !oldSet.has(e))
+  const removed = [...oldSet].filter(e => !newSet.has(e))
+
+  const events = [
+    ...added.map(emoji => ({ emoji, action: 'added' })),
+    ...removed.map(emoji => ({ emoji, action: 'removed' })),
+  ]
+
+  for (const { emoji, action } of events) {
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: `[reaction ${action}: ${emoji}]`,
+        meta: {
+          type: 'reaction',
+          chat_id,
+          message_id: String(msgId),
+          reaction: emoji,
+          action,
+          user: reaction.user?.username ?? userId,
+          user_id: userId,
+          ts: new Date((reaction.date ?? 0) * 1000).toISOString(),
+        },
+      },
+    }).catch(err => {
+      process.stderr.write(`telegram channel: failed to deliver reaction to Claude: ${err}\n`)
+    })
   }
 })
 
@@ -919,6 +1115,8 @@ async function handleInbound(
   const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
+  // Feature 1: capture message_thread_id for forum topic routing.
+  const threadId = ctx.message?.message_thread_id
 
   // Permission-reply intercept: if this looks like "yes xxxxx" for a
   // pending permission request, emit the structured event instead of
@@ -967,6 +1165,8 @@ async function handleInbound(
       meta: {
         chat_id,
         ...(msgId != null ? { message_id: String(msgId) } : {}),
+        // Feature 1: include thread ID when present so Claude can echo it back.
+        ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
         user: from.username ?? String(from.id),
         user_id: String(from.id),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
@@ -1000,6 +1200,14 @@ void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
+        // Feature 2: add message_reaction (and message_reaction_count) to
+        // allowed_updates so Telegram delivers reaction events via getUpdates.
+        allowed_updates: [
+          'message',
+          'callback_query',
+          'message_reaction',
+          'message_reaction_count',
+        ],
         onStart: info => {
           attempt = 0
           botUsername = info.username
