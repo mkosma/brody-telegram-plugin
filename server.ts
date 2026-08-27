@@ -1233,6 +1233,34 @@ bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
+// OUTCOME-LEVEL LIVENESS. Touch a heartbeat every time a getUpdates call
+// actually returns, so something outside this process can tell "polling is
+// alive" from "the process is alive".
+//
+// WHY A FILE AND NOT A PROCESS CHECK. fleet-supervisor's bot probe asks only
+// whether a server.ts process exists with this agent's TELEGRAM_STATE_DIR. That
+// cannot see a live process whose polling has stopped, which is exactly what
+// happened to Maya on 2026-08-25: roughly 40 minutes deaf to inbound, nothing
+// announcing it, and every process-level check green throughout. Process-alive
+// is not connection-healthy; the two only look identical from outside.
+//
+// A transformer sees EVERY API call, including the long-poll getUpdates that
+// nothing else surfaces, so this reports on the real poll cycle rather than on
+// a synthetic ping that could succeed while the poll loop is dead. If the call
+// throws, the heartbeat is deliberately NOT touched - going stale IS the signal.
+//
+// grammy's long-poll returns at least every ~30s even with no updates, so a
+// reader can treat anything past a few minutes as dead. Best-effort: a failed
+// write must never take down the bridge, which is why it is swallowed.
+const POLL_HEARTBEAT = join(STATE_DIR, 'poll.heartbeat')
+bot.api.config.use(async (prev, method, payload, signal) => {
+  const res = await prev(method, payload, signal)
+  if (method === 'getUpdates') {
+    try { writeFileSync(POLL_HEARTBEAT, new Date().toISOString() + '\n') } catch {}
+  }
+  return res
+})
+
 // Retry polling with backoff on any error. Previously only 409 was retried —
 // a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
 // returned, and polling stopped permanently while the process stayed alive
@@ -1275,6 +1303,13 @@ void (async () => {
           `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
           `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
         )
+        // ACTUALLY EXIT. This used to `return`, which left the process alive
+        // with MCP still connected and NO poller: outbound tools kept working,
+        // inbound was dead, and the message above claimed "Exiting" while the
+        // process sat there. A process-existence check calls that healthy
+        // forever. Dying here converts a silent zombie into a clean death that
+        // fleet-supervisor already detects and relaunches.
+        shutdown()
         return
       }
       const delay = Math.min(1000 * attempt, 15000)
