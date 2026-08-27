@@ -434,6 +434,8 @@ const mcp = new Server(
       '',
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has a message_thread_id attribute, the message is in a forum topic — pass message_thread_id back to reply to stay in that topic. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
+      'The FIRST thing to do on an inbound message is call react with \u{1F440} on its message_id. That is the sender\'s only signal that a live agent has actually read it: nothing in the transport reacts on your behalf, by design, because a transport-level reaction cannot tell "an agent read this" apart from "the bot process is running." React first, then do the work.',
+      '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
       'Reaction events arrive as <channel source="telegram" type="reaction" chat_id="..." message_id="..." user="..." reaction="..." action="added|removed" ts="..."/>. A reaction on a message is a lightweight confirmation signal — treat 👍 as "yes/proceed", 👎 as "no/cancel" unless context suggests otherwise.',
@@ -1176,16 +1178,23 @@ async function handleInbound(
   // startTyping). Signals "is composing" for the whole turn, not just ~5s.
   startTyping(chat_id)
 
-  // Ack reaction — lets the user know we're processing. Fire-and-forget.
-  // Telegram only accepts a fixed emoji whitelist — if the user configures
-  // something outside that set the API rejects it and we swallow.
-  if (access.ackReaction && msgId != null) {
-    void bot.api
-      .setMessageReaction(chat_id, msgId, [
-        { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
-      ])
-      .catch(() => {})
-  }
+  // NO transport-level ack reaction here, deliberately.
+  //
+  // This used to fire access.ackReaction the moment the bot process received
+  // the message, twelve lines before the MCP notification below was even
+  // attempted. That made the reaction a statement about THIS PROCESS being
+  // alive, not about any agent having read anything. On 2026-08-26 Monty got
+  // eyeballs from an agent whose MCP connection was down; the message was
+  // never delivered and the failure went to stderr, which nobody reads.
+  //
+  // Even acking after mcp.notification() would not fix it: that resolves when
+  // the write to the wire succeeds, which is not evidence the model saw it.
+  // Only the agent acting proves the agent read it, so the agent is what
+  // reacts now. See the 'react on your first turn' line in `instructions`.
+  //
+  // access.ackReaction is still parsed and still honored for the permission
+  // intercept above (that path knows its own outcome). It is intentionally
+  // NOT applied to ordinary inbound messages.
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
