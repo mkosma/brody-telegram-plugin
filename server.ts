@@ -500,7 +500,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           message_thread_id: {
             type: 'number',
-            description: 'Forum topic ID. Pass this when the inbound message has a message_thread_id attribute to keep replies in the same topic.',
+            description: 'Message thread id (a reply chain in any supergroup, or a forum topic where topics are enabled). Pass this back when the inbound message carried one, to keep replies in the same thread.',
           },
           reply_markup: {
             type: 'object',
