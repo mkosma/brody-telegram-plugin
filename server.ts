@@ -923,9 +923,25 @@ bot.on('callback_query:data', async ctx => {
     const path = /\.[a-z0-9]{2,5}$/i.test(rawPath) ? rawPath : `${rawPath}.md`
     const { exec } = await import('node:child_process')
     const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
-    const cmd = `ssh monty@mbp.local "/usr/local/bin/obsidian open path=${sq(path)} vault=${sq(vault)} newtab"`
-    exec(cmd, { timeout: 8000 }, (err) => {
-      if (err) process.stderr.write(`open-callback ssh failed: ${err.message}\n`)
+    // Delegate to open-markdown-file rather than driving obsidian-cli here.
+    //
+    // WHY THIS CHANGED, 2026-09-01. This handler had never once worked. It
+    // hardcoded BOTH the host (`ssh monty@mbp.local`, where Obsidian is not
+    // running) and the binary (`/usr/local/bin/obsidian`, which is the mbp
+    // path - on maxi it is /opt/homebrew/bin/obsidian). Every tap failed
+    // silently: the ssh error went to this process's stderr and nothing
+    // reached Monty, so the button looked inert rather than broken. Monty,
+    // 2026-09-01, on discovering the capability existed at all: "really
+    // puzzled why none of the bots were using it".
+    //
+    // open-markdown-file owns both problems: it resolves obsidian-cli rather
+    // than assuming a path, and it re-invokes itself over ssh on the GUI host
+    // when called from elsewhere, because obsidian-cli's socket is $HOME-scoped
+    // and does not cross NFS. Two hardcoded facts become zero.
+    const omf = '/Users/monty/.local/bin/open-markdown-file'
+    const cmd = `${omf} ${sq(`${vault}:${path}`)} --quiet`
+    exec(cmd, { timeout: 15000 }, (err, _stdout, stderr) => {
+      if (err) process.stderr.write(`open-callback failed: ${err.message} ${stderr}\n`)
     })
     await ctx.answerCallbackQuery({ text: `Opening ${path.split('/').pop()}` }).catch(() => {})
     return
