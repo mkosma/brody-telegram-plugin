@@ -906,6 +906,56 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
+  // Plugin-side open-doc handler, SHORT-ID form: callback_data `omf:<id>`.
+  //
+  // WHY AN ID AND NOT A PATH. Telegram caps callback_data at 64 BYTES, and a
+  // real vault-relative path blows straight through it - the document that
+  // prompted this, `WIP:Taiichi/working/SPEC-communication-waste-scorecard-
+  // 2026-09-01.md`, is 75 characters before the prefix. So `open:<vault>:<path>`
+  // below is only usable for short paths and silently cannot express most real
+  // ones. The id is a sha1 prefix of the absolute path, registered in a shared
+  // store by whoever builds the button.
+  //
+  // WHY THIS RUNS SERVER-SIDE RATHER THAN AS A CHANNEL EVENT TO CLAUDE. The
+  // generic path below hands the tap to the agent, which means every tap waits
+  // for that agent's next turn. Monty, 2026-09-01, testing exactly that: "it's
+  // only working sometime". It was working every time and arriving late, which
+  // is indistinguishable from broken and is worse, because it teaches him not
+  // to trust the button. This path answers in milliseconds and does not care
+  // whether a session is alive.
+  const omfMatch = /^omf:([0-9a-f]{6,16})$/.exec(data)
+  if (omfMatch) {
+    const accessOmf = loadAccess()
+    if (!accessOmf.allowFrom.includes(String(ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const STORE = '/Users/monty/.agents/_store/open-buttons.json'
+    let target: string | undefined
+    try {
+      const fs = await import('node:fs')
+      target = JSON.parse(fs.readFileSync(STORE, 'utf8'))[omfMatch[1]]
+    } catch (e) {
+      process.stderr.write(`omf store unreadable: ${e}\n`)
+    }
+    if (!target) {
+      // Say so rather than spinning. A button whose id has been swept is a
+      // real state and the tap must not look like a silent failure.
+      await ctx.answerCallbackQuery({ text: 'That link has expired.' }).catch(() => {})
+      return
+    }
+    // ACKNOWLEDGE FIRST, THEN DO THE WORK. Monty asked for feedback that the
+    // click landed; the toast is the feedback and it must not wait on obsidian.
+    await ctx.answerCallbackQuery({ text: `Opening ${target.split('/').pop()}` }).catch(() => {})
+    const { exec } = await import('node:child_process')
+    const sqOmf = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
+    exec(`/Users/monty/.local/bin/open-markdown-file ${sqOmf(target)} --quiet`,
+      { timeout: 15000 }, (err, _o, stderr) => {
+        if (err) process.stderr.write(`omf open failed: ${err.message} ${stderr}\n`)
+      })
+    return
+  }
+
   // Plugin-side open-doc handler: callback_data of the form open:<vault>:<path>
   // fires obsidian-cli on mbp directly. Does NOT round-trip through Claude,
   // so it works whether or not a Brody session is alive and attentive.
