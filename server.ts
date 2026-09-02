@@ -949,7 +949,12 @@ bot.on('callback_query:data', async ctx => {
     await ctx.answerCallbackQuery({ text: `Opening ${target.split('/').pop()}` }).catch(() => {})
     const { exec } = await import('node:child_process')
     const sqOmf = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
-    exec(`/Users/monty/.local/bin/open-markdown-file ${sqOmf(target)} --quiet`,
+    // --clicked: a tap IS the click, so this is mode (a) - the document goes
+    // into the ACTIVE tab and Obsidian comes forward. Without it the script
+    // probes, and a tap made while he is working in Obsidian would open the
+    // document QUIETLY in the background - correct for an unsolicited open and
+    // wrong for one he just asked for.
+    exec(`/Users/monty/.local/bin/open-markdown-file ${sqOmf(target)} --clicked --quiet`,
       { timeout: 15000 }, (err, _o, stderr) => {
         if (err) process.stderr.write(`omf open failed: ${err.message} ${stderr}\n`)
       })
@@ -989,7 +994,8 @@ bot.on('callback_query:data', async ctx => {
     // when called from elsewhere, because obsidian-cli's socket is $HOME-scoped
     // and does not cross NFS. Two hardcoded facts become zero.
     const omf = '/Users/monty/.local/bin/open-markdown-file'
-    const cmd = `${omf} ${sq(`${vault}:${path}`)} --quiet`
+    // --clicked for the same reason as the omf handler above: he tapped it.
+    const cmd = `${omf} ${sq(`${vault}:${path}`)} --clicked --quiet`
     exec(cmd, { timeout: 15000 }, (err, _stdout, stderr) => {
       if (err) process.stderr.write(`open-callback failed: ${err.message} ${stderr}\n`)
     })
