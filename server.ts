@@ -440,7 +440,7 @@ const mcp = new Server(
       '',
       'Reaction events arrive as <channel source="telegram" type="reaction" chat_id="..." message_id="..." user="..." reaction="..." action="added|removed" ts="..."/>. A reaction on a message is a lightweight confirmation signal — treat 👍 as "yes/proceed", 👎 as "no/cancel" unless context suggests otherwise.',
       '',
-      'To attach inline keyboard buttons to an outbound message, pass reply_markup with an inline_keyboard array. Each button needs text (label) and callback_data (a short string you choose). When Monty taps a button, a callback_query event arrives as <channel source="telegram" type="callback_query" chat_id="..." message_id="..." callback_data="..." user="..." ts="..."/>.',
+      'To attach inline keyboard buttons to an outbound message, pass reply_markup with an inline_keyboard array. Each button needs text (label) and callback_data (a short string you choose). A button also takes an optional style: "primary" (blue), "success" (green) or "danger" (red). Set one - the default has no color and renders nearly invisible against a macOS dark theme, which is a complaint Monty has actually made. When Monty taps a button, a callback_query event arrives as <channel source="telegram" type="callback_query" chat_id="..." message_id="..." callback_data="..." user="..." ts="..."/>.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -515,6 +515,25 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
                     properties: {
                       text: { type: 'string', description: 'Button label' },
                       callback_data: { type: 'string', description: 'Data sent back when tapped (max 64 bytes)' },
+                      // DECLARED SO IT SURVIVES THE TRIP, not for documentation.
+                      // Bot API 9.4 (2026-02-09) added `style`; grammy 1.41.1
+                      // types it, and the MCP SDK carries nested argument values
+                      // as z.unknown(), so neither end of the transport strips a
+                      // field it does not know. The one remaining place a field
+                      // can be dropped is a CALLER validating against this schema,
+                      // which is why an undeclared `style` is a silent no-op.
+                      //
+                      // Measured 2026-09-02: Monty asked for colored buttons
+                      // because the default renders "100% transparent and hard to
+                      // see" on macOS. A style passed while undeclared came back
+                      // uncolored on BOTH his macOS 12.10 and iOS clients, which
+                      // rules out the client-too-old explanation the docs warn
+                      // about and leaves this one.
+                      style: {
+                        type: 'string',
+                        enum: ['primary', 'success', 'danger'],
+                        description: 'Button color: primary (blue), success (green), danger (red). Omit for the app default, which renders near-transparent on macOS. Clients older than 2026-02-09 show the button unstyled rather than failing.',
+                      },
                     },
                     required: ['text', 'callback_data'],
                   },
