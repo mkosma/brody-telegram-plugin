@@ -628,7 +628,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const format = (args.format as string | undefined) ?? 'text'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
         // Feature 3: inline keyboard
-        const reply_markup = args.reply_markup as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } | undefined
+        // `style` is part of the button and must survive to the API. Leaving it
+        // out of this type was half of why it never reached Telegram; the
+        // keyboard construction below was the other half.
+        const reply_markup = args.reply_markup as
+          | { inline_keyboard: Array<Array<{ text: string; callback_data: string; style?: 'primary' | 'success' | 'danger' }>> }
+          | undefined
 
         assertAllowedChat(chat_id)
         // The reply is going out now — stop the "is composing" typing keepalive.
@@ -649,21 +654,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
 
-        // Feature 3: build an InlineKeyboard from reply_markup if provided.
+        // Feature 3: pass the caller's inline keyboard THROUGH, unrebuilt.
         // Only attach to the first chunk; subsequent chunks are overflow text.
-        let grammyKeyboard: InlineKeyboard | undefined
-        if (reply_markup?.inline_keyboard) {
-          grammyKeyboard = new InlineKeyboard()
-          for (let rowIdx = 0; rowIdx < reply_markup.inline_keyboard.length; rowIdx++) {
-            const row = reply_markup.inline_keyboard[rowIdx]
-            for (const btn of row) {
-              grammyKeyboard.text(btn.text, btn.callback_data)
-            }
-            if (rowIdx < reply_markup.inline_keyboard.length - 1) {
-              grammyKeyboard.row()
-            }
-          }
-        }
+        //
+        // THIS USED TO CALL grammyKeyboard.text(btn.text, btn.callback_data),
+        // which takes exactly two arguments and therefore DROPPED `style` by
+        // construction. Every styled button the fleet has ever sent arrived
+        // uncolored because of this line, and two previous attempts to fix the
+        // problem never looked at it: one blamed the caller's schema validation
+        // (1fb9acd) and one blamed the client being too old. Both were wrong.
+        //
+        // Settled 2026-09-03 by posting the same four buttons twice, once
+        // straight to the Bot API and once through here. The API set came back
+        // blue, green and red; ours came back plain. So the API stores `style`,
+        // Monty's client renders it, and this function was the only thing
+        // standing between them.
+        //
+        // Building the markup as a plain object instead of via the InlineKeyboard
+        // builder keeps every field the caller sent, including ones added to the
+        // Bot API after this code was written. A builder that enumerates the
+        // fields it knows will silently drop the next one too.
+        const grammyKeyboard = reply_markup?.inline_keyboard
+          ? { inline_keyboard: reply_markup.inline_keyboard.map(row => row.map(btn => ({ ...btn }))) }
+          : undefined
 
         try {
           for (let i = 0; i < chunks.length; i++) {
