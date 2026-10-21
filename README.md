@@ -56,10 +56,10 @@ That command loads the marketplace copy. To launch this fork, substitute the plu
 
 **5. Pair.**
 
-With Claude Code running from the previous step, DM your bot on Telegram — it replies with a 6-character pairing code. If the bot doesn't respond, make sure your session is running with `--channels`. In your Claude Code session:
+With Claude Code running from the previous step, DM your bot on Telegram — it replies with a 6-character pairing code. If the bot doesn't respond, make sure your session is running with `--channels`. In a terminal:
 
 ```
-/telegram:access pair <code>
+edit-telegram-access <Agent> pair <code>
 ```
 
 Your next DM reaches the assistant.
@@ -68,7 +68,7 @@ Your next DM reaches the assistant.
 
 **6. Lock it down.**
 
-Pairing is for capturing IDs. Once you're in, switch to `allowlist` so strangers don't get pairing-code replies. Ask Claude to do it, or `/telegram:access policy allowlist` directly.
+Pairing is for capturing IDs. Once you're in, switch to `allowlist` so strangers don't get pairing-code replies. Set `dmPolicy` to `allowlist` in the bot's `access.json` (`edit-telegram-access` has no policy verb yet).
 
 ## Access control
 
