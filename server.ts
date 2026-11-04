@@ -27,6 +27,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep, basename } from 'path'
+import { tapToast, type TapOutcome } from './tap-toast.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -1049,19 +1050,25 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
-  // Feature 3: General inline keyboard callback — surface to Claude as a channel event.
-  // Acknowledge the tap immediately so Telegram removes the "loading" spinner.
-  await ctx.answerCallbackQuery().catch(() => {})
-
+  // Feature 3: General inline keyboard callback - surface to Claude as a channel event.
+  //
+  // The tap is answered AFTER the hand-off, with a toast saying where it went,
+  // so Monty can see it landed. It used to be answered first with no text,
+  // which cleared the spinner and told him nothing (Monty, 2026-11-04: "I wish
+  // the telegram buttons gave me some sort of visual response"). The hand-off
+  // is raced against 2s so a slow channel cannot leave the spinner up.
   const access = loadAccess()
   const senderId = String(ctx.from.id)
   // Only deliver to allowlisted users (same gate as inbound messages).
-  if (!access.allowFrom.includes(senderId)) return
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
 
   const chat_id = ctx.callbackQuery.message ? String(ctx.callbackQuery.message.chat.id) : senderId
   const origMessageId = ctx.callbackQuery.message?.message_id
 
-  mcp.notification({
+  const delivery: Promise<TapOutcome> = mcp.notification({
     method: 'notifications/claude/channel',
     params: {
       content: `[button tapped: ${data}]`,
@@ -1075,9 +1082,21 @@ bot.on('callback_query:data', async ctx => {
         ts: new Date().toISOString(),
       },
     },
-  }).catch(err => {
-    process.stderr.write(`telegram channel: failed to deliver callback_query to Claude: ${err}\n`)
-  })
+  }).then(
+    () => 'resolved' as const,
+    err => {
+      process.stderr.write(`telegram channel: failed to deliver callback_query to Claude: ${err}\n`)
+      return 'rejected' as const
+    },
+  )
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const outcome = await Promise.race([
+    delivery,
+    new Promise<TapOutcome>(r => { timer = setTimeout(() => r('timeout'), 2000) }),
+  ])
+  clearTimeout(timer)
+  const toast = tapToast(outcome, ACCESS_AGENT, data, ctx.callbackQuery.message?.reply_markup)
+  await ctx.answerCallbackQuery({ text: toast }).catch(() => {})
 })
 
 // Feature 2: Reactions — surface as channel events so Claude can treat 👍/👎
