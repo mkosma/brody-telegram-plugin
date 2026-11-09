@@ -28,7 +28,8 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, renameSync
 import { homedir } from 'os'
 import { join, sep, basename } from 'path'
 import { tapToast, type TapOutcome } from './tap-toast.ts'
-import { runReply } from './reply.ts'
+import { runReply, runEditMessage } from './reply.ts'
+import { makeTee, teeInbound, TEE_DIR } from './post-log.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -106,6 +107,11 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
 let botUsername = ''
+
+// The post log (spec item 1): every group post this bot sends or receives, one
+// JSON line each, in a file named for this bot. Local disk only; a failed write
+// is one stderr line and never touches the send.
+const tee = makeTee({ dir: TEE_DIR, bot: () => botUsername })
 
 // --- Typing keepalive ----------------------------------------------------
 // Telegram's "typing…" indicator (sendChatAction) auto-expires after ~5s, so a
@@ -605,7 +611,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     switch (req.params.name) {
       case 'reply':
         return await runReply(
-          { api: bot.api, loadAccess, assertAllowedChat, assertSendable, stopTyping },
+          { api: bot.api, loadAccess, assertAllowedChat, assertSendable, stopTyping, tee },
           args,
         )
       case 'react': {
@@ -633,19 +639,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         writeFileSync(path, buf)
         return { content: [{ type: 'text', text: path }] }
       }
-      case 'edit_message': {
-        assertAllowedChat(args.chat_id as string)
-        const editFormat = (args.format as string | undefined) ?? 'text'
-        const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
-        const edited = await bot.api.editMessageText(
-          args.chat_id as string,
-          Number(args.message_id),
-          args.text as string,
-          ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
-        )
-        const id = typeof edited === 'object' ? edited.message_id : args.message_id
-        return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
-      }
+      case 'edit_message':
+        return await runEditMessage({ api: bot.api, assertAllowedChat, tee }, args)
       case 'create_forum_topic': {
         // Feature 1: create a new forum topic in a supergroup with topics enabled.
         assertAllowedChat(args.chat_id as string)
@@ -1136,7 +1131,12 @@ async function handleInbound(
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
 ): Promise<void> {
-  const result = gate(ctx)
+  // Logged whatever the gate decides, so a post the gate drops is still on the
+  // record (delivered:false). Groups only; teeInbound skips a DM.
+  const result = teeInbound(
+    { message: ctx.message, chat: ctx.chat, from: ctx.from, text, tee },
+    () => gate(ctx),
+  )
 
   if (result.action === 'drop') return
 

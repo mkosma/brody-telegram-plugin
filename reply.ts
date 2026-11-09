@@ -8,8 +8,9 @@
  */
 
 import { statSync } from 'fs'
-import { extname } from 'path'
+import { basename, extname } from 'path'
 import { InputFile } from 'grammy'
+import { isGroupChatId, outEntry, safeTee, type Tee } from './post-log.ts'
 
 export const MAX_CHUNK_LIMIT = 4096
 export const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -38,7 +39,12 @@ export type ReplyDeps = {
   assertAllowedChat: (chat_id: string) => void
   assertSendable: (f: string) => void
   stopTyping: (chat_id: string) => void
+  /** The post log. Absent means no logging; a throwing one never fails a send. */
+  tee?: Tee
 }
+
+// One record per message id Telegram gave back, in send order.
+type SentPost = { message_id: number; text: string; reply_to?: number }
 
 // Telegram caps messages at 4096 chars. Split long replies, preferring
 // paragraph boundaries when chunkMode is 'newline'.
@@ -103,6 +109,7 @@ export async function runReply(
   const replyMode = access.replyToMode ?? 'first'
   const chunks = chunk(text, limit, mode)
   const sentIds: number[] = []
+  const posts: SentPost[] = []
 
   // Feature 3: pass the caller's inline keyboard THROUGH, unrebuilt.
   // Only attach to the first chunk; subsequent chunks are overflow text.
@@ -128,46 +135,64 @@ export async function runReply(
     ? { inline_keyboard: reply_markup.inline_keyboard.map(row => row.map(btn => ({ ...btn }))) }
     : undefined
 
-  try {
-    for (let i = 0; i < chunks.length; i++) {
-      const shouldReplyTo =
-        reply_to != null &&
-        replyMode !== 'off' &&
-        (replyMode === 'all' || i === 0)
-      // Attach keyboard only to the first (or only) chunk.
-      const chunkKeyboard = i === 0 ? grammyKeyboard : undefined
-      const sent = await api.sendMessage(chat_id, chunks[i], {
-        ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-        ...(parseMode ? { parse_mode: parseMode } : {}),
-        ...(message_thread_id != null ? { message_thread_id } : {}),
-        ...(chunkKeyboard ? { reply_markup: chunkKeyboard } : {}),
-      })
-      sentIds.push(sent.message_id)
+  // Log whatever actually went out, including the chunks sent before a
+  // failure: those are in the chat whether or not the reply as a whole failed.
+  const sendAll = async (): Promise<void> => {
+    try {
+      for (let i = 0; i < chunks.length; i++) {
+        const shouldReplyTo =
+          reply_to != null &&
+          replyMode !== 'off' &&
+          (replyMode === 'all' || i === 0)
+        // Attach keyboard only to the first (or only) chunk.
+        const chunkKeyboard = i === 0 ? grammyKeyboard : undefined
+        const sent = await api.sendMessage(chat_id, chunks[i], {
+          ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+          ...(parseMode ? { parse_mode: parseMode } : {}),
+          ...(message_thread_id != null ? { message_thread_id } : {}),
+          ...(chunkKeyboard ? { reply_markup: chunkKeyboard } : {}),
+        })
+        sentIds.push(sent.message_id)
+        posts.push({ message_id: sent.message_id, text: chunks[i], ...(shouldReplyTo ? { reply_to } : {}) })
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      throw new Error(
+        `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`,
+      )
     }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    throw new Error(
-      `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`,
-    )
+
+    // Files go as separate messages (Telegram doesn't mix text+file in one
+    // sendMessage call). Thread under reply_to and/or topic if present.
+    for (const f of files) {
+      const ext = extname(f).toLowerCase()
+      const input = new InputFile(f)
+      const opts = {
+        ...(reply_to != null && replyMode !== 'off'
+          ? { reply_parameters: { message_id: reply_to } }
+          : {}),
+        ...(message_thread_id != null ? { message_thread_id } : {}),
+      }
+      const fileReplyTo = reply_to != null && replyMode !== 'off' ? { reply_to } : {}
+      if (PHOTO_EXTS.has(ext)) {
+        const sent = await api.sendPhoto(chat_id, input, Object.keys(opts).length ? opts : undefined)
+        sentIds.push(sent.message_id)
+        posts.push({ message_id: sent.message_id, text: `(photo: ${basename(f)})`, ...fileReplyTo })
+      } else {
+        const sent = await api.sendDocument(chat_id, input, Object.keys(opts).length ? opts : undefined)
+        sentIds.push(sent.message_id)
+        posts.push({ message_id: sent.message_id, text: `(document: ${basename(f)})`, ...fileReplyTo })
+      }
+    }
   }
 
-  // Files go as separate messages (Telegram doesn't mix text+file in one
-  // sendMessage call). Thread under reply_to and/or topic if present.
-  for (const f of files) {
-    const ext = extname(f).toLowerCase()
-    const input = new InputFile(f)
-    const opts = {
-      ...(reply_to != null && replyMode !== 'off'
-        ? { reply_parameters: { message_id: reply_to } }
-        : {}),
-      ...(message_thread_id != null ? { message_thread_id } : {}),
-    }
-    if (PHOTO_EXTS.has(ext)) {
-      const sent = await api.sendPhoto(chat_id, input, Object.keys(opts).length ? opts : undefined)
-      sentIds.push(sent.message_id)
-    } else {
-      const sent = await api.sendDocument(chat_id, input, Object.keys(opts).length ? opts : undefined)
-      sentIds.push(sent.message_id)
+  try {
+    await sendAll()
+  } finally {
+    if (isGroupChatId(chat_id)) {
+      for (const p of posts) {
+        safeTee(deps.tee, outEntry({ chat_id, thread_id: message_thread_id, ...p, edit: false }))
+      }
     }
   }
 
@@ -176,4 +201,42 @@ export async function runReply(
       ? `sent (id: ${sentIds[0]})`
       : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
   return { content: [{ type: 'text', text: result }] }
+}
+
+export type EditApi = {
+  editMessageText(
+    chat_id: string,
+    message_id: number,
+    text: string,
+    other?: Record<string, unknown>,
+  ): Promise<true | { message_id: number; message_thread_id?: number; reply_to_message?: { message_id: number } }>
+}
+
+export async function runEditMessage(
+  deps: { api: EditApi; assertAllowedChat: (chat_id: string) => void; tee?: Tee },
+  args: Record<string, unknown>,
+): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+  const chat_id = args.chat_id as string
+  deps.assertAllowedChat(chat_id)
+  const editFormat = (args.format as string | undefined) ?? 'text'
+  const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
+  const edited = await deps.api.editMessageText(
+    chat_id,
+    Number(args.message_id),
+    args.text as string,
+    ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
+  )
+  const id = typeof edited === 'object' ? edited.message_id : args.message_id
+  if (isGroupChatId(chat_id)) {
+    const msg = typeof edited === 'object' ? edited : undefined
+    safeTee(deps.tee, outEntry({
+      chat_id,
+      thread_id: msg?.message_thread_id,
+      message_id: Number(id),
+      reply_to: msg?.reply_to_message?.message_id,
+      text: args.text as string,
+      edit: true,
+    }))
+  }
+  return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
 }
