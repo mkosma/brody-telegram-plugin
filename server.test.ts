@@ -312,6 +312,9 @@ test("relay: tagging the bridge's own bot calls nothing", () => {
   const r = fakeRunner()
   expect(relayFor(r.run)(tagged('note to self @MK_VeraBot'))).toBeUndefined()
   expect(r.calls.length).toBe(0)
+  // The own-bot check stands alone: a bot whose username is not MK_<Agent>Bot.
+  expect(relayTags({ sender: 'Vera', ownBot: () => 'MK_VeraTestBot', title: () => 'Fleet', run: r.run, limiter: new RelayLimiter(), roster: () => ROSTER, stderr: () => {} },
+    tagged('note to self @MK_VeraTestBot'))).toBeUndefined()
 })
 
 test('relay: tagging @EmmaBrodybot calls nothing', () => {
