@@ -404,7 +404,11 @@ REVERTS = [
      "headless: any other tap is answered, never passed and never left spinning"),
 ]
 
-FAIL_RE = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)
+# Not anchored at line start: bun cuts a long `Received:` value (a test that
+# reads all of server.ts) at about 64KB with no newline, so once server.ts
+# outgrew that the `(fail)` line arrived glued to the dump. Anchored, I13, P7
+# and W20 went red and read as MISS.
+FAIL_RE = re.compile(r"\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)
 
 
 def copy_tree(dst):
