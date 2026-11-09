@@ -32,7 +32,8 @@ import { runReply, runEditMessage } from './reply.ts'
 import { makeTee, teeInbound, safeTee, outEntry, TEE_DIR } from './post-log.ts'
 import { planGroupCommand, runGroupCommand, type CommandDeps, type CommandPlan } from './invite-excuse.ts'
 import { PhrasePicker, phrasesFile } from './phrases.ts'
-import { groupDecision, type GroupPolicy } from './group-gate.ts'
+import { type GroupPolicy } from './group-gate.ts'
+import { inboundDecision, inboundText, safeName, parseEnvFile, ALLOWED_UPDATES } from './inbound-gate.ts'
 import { relayTags, RelayLimiter, spawnRunner, readRoster, type RelayRequest } from './tag-relay.ts'
 import { runEditForumTopic } from './forum-topic.ts'
 
@@ -60,9 +61,8 @@ const ACCESS_CMD = `edit-telegram-access ${ACCESS_AGENT}`
 try {
   // Token is a credential — lock to owner. No-op on Windows (would need ACLs).
   chmodSync(ENV_FILE, 0o600)
-  for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
-    const m = line.match(/^(\w+)=(.*)$/)
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+  for (const [k, v] of Object.entries(parseEnvFile(readFileSync(ENV_FILE, 'utf8')))) {
+    if (process.env[k] === undefined) process.env[k] = v
   }
 } catch {}
 
@@ -299,17 +299,14 @@ function gate(ctx: Context): GateResult {
   const pruned = pruneExpired(access)
   if (pruned) saveAccess(access)
 
-  if (access.dmPolicy === 'disabled') return { action: 'drop' }
+  // The decision itself is inbound-gate.ts, shared with wake-check.ts.
+  const decision = inboundDecision(access, ctx, botUsername, ACCESS_AGENT)
+  if (decision === 'deliver') return { action: 'deliver', access }
+  if (decision === 'drop') return { action: 'drop' }
 
-  const from = ctx.from
-  if (!from) return { action: 'drop' }
-  const senderId = String(from.id)
-  const chatType = ctx.chat?.type
-
-  if (chatType === 'private') {
-    if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
-    if (access.dmPolicy === 'allowlist') return { action: 'drop' }
-
+  // 'pair': a stranger's DM under dmPolicy "pairing".
+  {
+    const senderId = String(ctx.from!.id)
     // pairing mode — check for existing non-expired code for this sender
     for (const [code, p] of Object.entries(access.pending)) {
       if (p.senderId === senderId) {
@@ -335,17 +332,6 @@ function gate(ctx: Context): GateResult {
     saveAccess(access)
     return { action: 'pair', code, isResend: false }
   }
-
-  if (chatType === 'group' || chatType === 'supergroup') {
-    // requireMention can be set per thread (groups[id].threads[thread_id]);
-    // see group-gate.ts. access.json is re-read here on every message.
-    const policy = access.groups[String(ctx.chat!.id)]
-    return groupDecision(policy, senderId, ctx.message, botUsername, access.mentionPatterns, ACCESS_AGENT) === 'deliver'
-      ? { action: 'deliver', access }
-      : { action: 'drop' }
-  }
-
-  return { action: 'drop' }
 }
 
 // Like gate() but for bot commands: no pairing side effects, just allow/drop.
@@ -1014,11 +1000,11 @@ bot.on('message_reaction', async ctx => {
 })
 
 bot.on('message:text', async ctx => {
-  await handleInbound(ctx, ctx.message.text, undefined)
+  await handleInbound(ctx, inboundText(ctx.message)!, undefined)
 })
 
 bot.on('message:photo', async ctx => {
-  const caption = ctx.message.caption ?? '(photo)'
+  const caption = inboundText(ctx.message)!
   // Defer download until after the gate approves — any user can send photos,
   // and we don't want to burn API quota or fill the inbox for dropped messages.
   await handleInbound(ctx, caption, async () => {
@@ -1046,7 +1032,7 @@ bot.on('message:photo', async ctx => {
 bot.on('message:document', async ctx => {
   const doc = ctx.message.document
   const name = safeName(doc.file_name)
-  const text = ctx.message.caption ?? `(document: ${name ?? 'file'})`
+  const text = inboundText(ctx.message)!
   await handleInbound(ctx, text, undefined, {
     kind: 'document',
     file_id: doc.file_id,
@@ -1058,7 +1044,7 @@ bot.on('message:document', async ctx => {
 
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
-  const text = ctx.message.caption ?? '(voice message)'
+  const text = inboundText(ctx.message)!
   await handleInbound(ctx, text, undefined, {
     kind: 'voice',
     file_id: voice.file_id,
@@ -1070,7 +1056,7 @@ bot.on('message:voice', async ctx => {
 bot.on('message:audio', async ctx => {
   const audio = ctx.message.audio
   const name = safeName(audio.file_name)
-  const text = ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`
+  const text = inboundText(ctx.message)!
   await handleInbound(ctx, text, undefined, {
     kind: 'audio',
     file_id: audio.file_id,
@@ -1082,7 +1068,7 @@ bot.on('message:audio', async ctx => {
 
 bot.on('message:video', async ctx => {
   const video = ctx.message.video
-  const text = ctx.message.caption ?? '(video)'
+  const text = inboundText(ctx.message)!
   await handleInbound(ctx, text, undefined, {
     kind: 'video',
     file_id: video.file_id,
@@ -1094,7 +1080,7 @@ bot.on('message:video', async ctx => {
 
 bot.on('message:video_note', async ctx => {
   const vn = ctx.message.video_note
-  await handleInbound(ctx, '(video note)', undefined, {
+  await handleInbound(ctx, inboundText(ctx.message)!, undefined, {
     kind: 'video_note',
     file_id: vn.file_id,
     size: vn.file_size,
@@ -1103,8 +1089,7 @@ bot.on('message:video_note', async ctx => {
 
 bot.on('message:sticker', async ctx => {
   const sticker = ctx.message.sticker
-  const emoji = sticker.emoji ? ` ${sticker.emoji}` : ''
-  await handleInbound(ctx, `(sticker${emoji})`, undefined, {
+  await handleInbound(ctx, inboundText(ctx.message)!, undefined, {
     kind: 'sticker',
     file_id: sticker.file_id,
     size: sticker.file_size,
@@ -1119,12 +1104,7 @@ type AttachmentMeta = {
   name?: string
 }
 
-// Filenames and titles are uploader-controlled. They land inside the <channel>
-// notification — delimiter chars would let the uploader break out of the tag
-// or forge a second meta entry.
-function safeName(s: string | undefined): string | undefined {
-  return s?.replace(/[<>\[\]\r\n;]/g, '_')
-}
+// safeName (uploader-controlled filenames and titles) lives in inbound-gate.ts.
 
 // /invite and /excuse (invite-excuse.ts). The answer is posted by the bridge
 // into the command's own thread and logged like any group post we send. The
@@ -1341,12 +1321,7 @@ void (async () => {
       await bot.start({
         // Feature 2: add message_reaction (and message_reaction_count) to
         // allowed_updates so Telegram delivers reaction events via getUpdates.
-        allowed_updates: [
-          'message',
-          'callback_query',
-          'message_reaction',
-          'message_reaction_count',
-        ],
+        allowed_updates: [...ALLOWED_UPDATES],
         onStart: info => {
           attempt = 0
           botUsername = info.username

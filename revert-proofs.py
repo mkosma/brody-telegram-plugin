@@ -91,8 +91,8 @@ REVERTS = [
      "  if (!agent) return undefined\n",
      "name mention: an unverified name has no pattern"),
     ("N4", "@name mention", "server.ts",
-     "access.mentionPatterns, ACCESS_AGENT) === 'deliver'",
-     "access.mentionPatterns) === 'deliver'",
+     "inboundDecision(access, ctx, botUsername, ACCESS_AGENT)",
+     "inboundDecision(access, ctx, botUsername, '<Agent>')",
      "name mention: gate() passes the bridge's agent name to groupDecision"),
     # SPEC-bridge-names-invite-excuse-2026-11-09, item 1, the relay
     ("L1", "@name relay", "tag-relay.ts",

@@ -481,13 +481,15 @@ test('name mention: the gate delivers @vera in a mention-only thread', () => {
 })
 
 // server.ts cannot be imported (it starts the bot), so the one wiring line is
-// checked in the source: the gate hands the verified agent name to the group
-// decision.
+// checked in the source: the gate hands the verified agent name to the shared
+// decision (inbound-gate.ts), and that decision hands it to groupDecision.
 test("name mention: gate() passes the bridge's agent name to groupDecision", () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
   const start = src.indexOf('function gate(ctx: Context)')
   const body = src.slice(start, src.indexOf('\n}\n', start))
-  expect(body).toMatch(/groupDecision\([^)]*access\.mentionPatterns, ACCESS_AGENT\)/)
+  expect(body).toContain('inboundDecision(access, ctx, botUsername, ACCESS_AGENT)')
+  const shared = readFileSync(join(import.meta.dir, 'inbound-gate.ts'), 'utf8')
+  expect(shared).toMatch(/groupDecision\([^)]*access\.mentionPatterns, agent\)/)
 })
 
 // Item 1, relay half. Acceptance 2.
