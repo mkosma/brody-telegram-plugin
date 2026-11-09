@@ -14,6 +14,12 @@
  * own tags are never relayed: he is human, and Telegram already delivers his
  * post to every bot in the group. Only outbound posts reach this code.
  *
+ * ROSTER. SPEC-bridge-names-invite-excuse-2026-11-09 item 1: the relay's
+ * allowlist is the standing roster ($FLEET_HANDOFF_AGENTS, from
+ * agent-homes.env), not whatever `dispatch resolve` accepts, and a bare
+ * `@<name>` of a roster agent is a tag too. If the roster cannot be read,
+ * nothing relays and each tag is recorded skipped:"no-roster".
+ *
  * IDENTITY. `dispatch send --from <Agent>` proves the sender by ancestry: the
  * agent's lock pid must be an ancestor of the dispatch process. The bridge is
  * a child of the agent's session, so a dispatch it spawns passes. If it ever
@@ -31,7 +37,7 @@ const SEND_TIMEOUT_MS = 20_000
 /** rc of the process; 124 when it was killed at the timeout, 127 when it could not start. */
 export type Runner = (argv: string[], stdin: string | undefined, timeoutMs: number) => Promise<{ rc: number; stderr: string }>
 
-export type RelayOutcome = { to: string; rc?: number; skipped?: 'rate' | 'roster' | 'sender-unverified' }
+export type RelayOutcome = { to: string; rc?: number; skipped?: 'rate' | 'roster' | 'no-roster' | 'sender-unverified' }
 
 type Entity = { type: string; offset: number; length: number }
 
@@ -54,6 +60,21 @@ export function tagsIn(text: string, entities?: Entity[]): string[] {
     return mentions.map(e => text.slice(e.offset + 1, e.offset + e.length))
   }
   return [...text.matchAll(/(?<![A-Za-z0-9_@])@([A-Za-z][A-Za-z0-9_]{3,31})/g)].map(m => m[1])
+}
+
+/** `@<name>` tokens in one sent message, without the @: `@maya`, `hi @Maya,`; never `x@maya.com` or `@MK_MayaBot`. */
+export function namesIn(text: string): string[] {
+  return [...text.matchAll(/(?:^|[^\w@])@([A-Za-z][A-Za-z0-9]*)(?![\w])/g)].map(m => m[1])
+}
+
+/**
+ * The standing roster, read from $FLEET_HANDOFF_AGENTS (space-separated, as
+ * agent-homes.env sets it and the claude() wrapper reads it). Undefined when
+ * it is unset or holds no name: the caller relays nothing.
+ */
+export function readRoster(env: Record<string, string | undefined> = process.env): string[] | undefined {
+  const names = (env.FLEET_HANDOFF_AGENTS ?? '').split(/\s+/).filter(n => /^[A-Za-z][A-Za-z0-9]*$/.test(n))
+  return names.length > 0 ? names : undefined
 }
 
 /** At most `max` relays per (sender, recipient) pair in any rolling hour. */
@@ -88,6 +109,8 @@ export type RelayDeps = {
   title: (chat_id: string) => string | undefined
   run: Runner
   limiter: RelayLimiter
+  /** The standing roster; undefined when it could not be read. */
+  roster: () => string[] | undefined
   stderr?: (line: string) => void
   dispatch?: string
 }
@@ -99,28 +122,47 @@ export type RelayDeps = {
  */
 export function relayTags(deps: RelayDeps, req: RelayRequest): Promise<RelayOutcome[]> | undefined {
   const own = deps.ownBot().toLowerCase()
+  const roster = deps.roster()
+  const inRoster = (name: string) => roster?.find(r => r.toLowerCase() === name.toLowerCase())
   const seen = new Set<string>()
-  const targets: Array<{ agent: string; username: string }> = []
+  const targets: Array<{ agent: string; username: string; skip?: RelayOutcome['skipped'] }> = []
+  const add = (agent: string, username: string, skip?: RelayOutcome['skipped']) => {
+    if (agent.toLowerCase() === deps.sender.toLowerCase()) return
+    if (seen.has(agent.toLowerCase())) return
+    seen.add(agent.toLowerCase())
+    targets.push({ agent, username, skip })
+  }
   for (const p of req.posts) {
     for (const u of tagsIn(p.text, p.entities)) {
       if (own && u.toLowerCase() === own) continue
       const agent = botAgent(u)
       if (!agent) continue
-      if (agent.toLowerCase() === deps.sender.toLowerCase()) continue
-      if (seen.has(agent.toLowerCase())) continue
-      seen.add(agent.toLowerCase())
-      targets.push({ agent, username: u })
+      const member = inRoster(agent)
+      if (!roster) add(agent, u, 'no-roster')
+      else add(member ?? agent, u, member ? undefined : 'roster')
+    }
+    // A bare @<name> is a tag only of a roster agent; @monty, @page and the
+    // rest are names, not addresses, and are passed over without a record.
+    // With no roster there is no telling, so each is recorded as unchecked.
+    for (const n of namesIn(p.text)) {
+      const member = inRoster(n)
+      if (!roster) add(n[0].toUpperCase() + n.slice(1), n, 'no-roster')
+      else if (member) add(member, n)
     }
   }
   if (targets.length === 0) return undefined
 
   const stderr = deps.stderr ?? ((l: string) => { process.stderr.write(l) })
+  if (!roster) {
+    stderr('telegram channel: tag relay skipped: the standing roster ($FLEET_HANDOFF_AGENTS) could not be read\n')
+  }
   const dispatch = deps.dispatch ?? 'dispatch'
   const first = req.posts[0]
   const where = `${deps.title(req.chat_id) ?? req.chat_id}/${req.thread_id ?? 'General'}`
   const text = req.posts.map(p => p.text).join('')
 
-  return Promise.all(targets.map(async ({ agent, username }): Promise<RelayOutcome> => {
+  return Promise.all(targets.map(async ({ agent, username, skip }): Promise<RelayOutcome> => {
+    if (skip) return { to: agent, skipped: skip }
     // The sender name is what dispatch will check against the lock. A name the
     // wrapper could not verify is not one to sign with.
     if (deps.sender === '<Agent>' || !deps.sender) {

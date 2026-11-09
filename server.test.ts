@@ -278,9 +278,11 @@ function fakeRunner(rcFor: (argv: string[]) => number = () => 0) {
   return { calls, run, sends: () => calls.filter(c => c.argv[1] === 'send') }
 }
 
+const ROSTER = ['Vera', 'Maya', 'Grady', 'Taiichi', 'Werner']
+
 function relayFor(run: Runner, limiter = new RelayLimiter(), errs: string[] = []) {
   return (req: RelayRequest) => relayTags({
-    sender: 'Vera', ownBot: () => 'MK_VeraBot', title: () => 'Fleet', run, limiter, stderr: l => { errs.push(l) },
+    sender: 'Vera', ownBot: () => 'MK_VeraBot', title: () => 'Fleet', run, limiter, roster: () => ROSTER, stderr: l => { errs.push(l) },
   }, req)
 }
 
@@ -367,7 +369,7 @@ test('relay: a refused identity (dispatch exit 7) is recorded and reported, not 
 
 test('relay: an unverified agent name never signs a send', async () => {
   const r = fakeRunner()
-  const out = await relayTags({ sender: '<Agent>', ownBot: () => 'MK_VeraBot', title: () => undefined, run: r.run, limiter: new RelayLimiter(), stderr: () => {} },
+  const out = await relayTags({ sender: '<Agent>', ownBot: () => 'MK_VeraBot', title: () => undefined, run: r.run, limiter: new RelayLimiter(), roster: () => ROSTER, stderr: () => {} },
     tagged('@MK_MayaBot hi'))
   expect(out).toEqual([{ to: 'Maya', skipped: 'sender-unverified' }])
   expect(r.calls.length).toBe(0)
@@ -483,4 +485,71 @@ test("name mention: gate() passes the bridge's agent name to groupDecision", () 
   const start = src.indexOf('function gate(ctx: Context)')
   const body = src.slice(start, src.indexOf('\n}\n', start))
   expect(body).toMatch(/groupDecision\([^)]*access\.mentionPatterns, ACCESS_AGENT\)/)
+})
+
+// Item 1, relay half. Acceptance 2.
+
+import { namesIn, readRoster } from './tag-relay.ts'
+
+test("relay: @maya in a post of Vera's relays to Maya", async () => {
+  const r = fakeRunner()
+  const outcomes = await relayFor(r.run)(tagged('@maya what is playing in the kitchen?'))
+  expect(outcomes).toEqual([{ to: 'Maya', rc: 0 }])
+  expect(r.sends().length).toBe(1)
+  expect(r.sends()[0].argv.slice(0, 4)).toEqual(['dispatch', 'send', '--to', 'agent:Maya'])
+  expect(r.sends()[0].stdin).toContain('Vera tagged @maya in a Telegram group post.')
+  // Telegram's entities for a mention do not stop a bare name being seen.
+  const r2 = fakeRunner()
+  const text = 'hi @maya and @MK_GradyBot'
+  expect(await relayTags({ sender: 'Vera', ownBot: () => 'MK_VeraBot', title: () => 'Fleet', run: r2.run, limiter: new RelayLimiter(), roster: () => ROSTER, stderr: () => {} },
+    { chat_id: GROUP, posts: [{ message_id: 1, text, entities: [{ type: 'mention', offset: 13, length: 12 }] }] }))
+    .toEqual([{ to: 'Grady', rc: 0 }, { to: 'Maya', rc: 0 }])
+})
+
+test('relay: @monty, @page and @clerk relay nothing', () => {
+  const r = fakeRunner()
+  expect(relayFor(r.run)(tagged('@monty @page @clerk @builder please look'))).toBeUndefined()
+  expect(r.calls.length).toBe(0)
+  // @vera from Vera, an e-mail address, and a bot-shaped name are not tags either.
+  expect(relayFor(r.run)(tagged('@vera, mail x@maya.com'))).toBeUndefined()
+  expect(namesIn('@maya @Maya, x@maya.com @MK_MayaBot @mayabot')).toEqual(['maya', 'Maya', 'mayabot'])
+})
+
+test('relay: a bot username off the standing roster is skipped, whatever dispatch resolve says', async () => {
+  const r = fakeRunner() // resolve would accept anything
+  expect(await relayFor(r.run)(tagged('@MK_PageBot @MK_ClerkBot hello'))).toEqual([
+    { to: 'Page', skipped: 'roster' }, { to: 'Clerk', skipped: 'roster' },
+  ])
+  expect(r.calls.length).toBe(0)
+})
+
+test('relay: if the roster cannot be read, nothing relays and skipped:"no-roster" is logged', async () => {
+  const dir = teeDir()
+  const r = fakeRunner()
+  const errs: string[] = []
+  const relay = (req: RelayRequest) => relayTags({
+    sender: 'Vera', ownBot: () => 'MK_VeraBot', title: () => 'Fleet', run: r.run, limiter: new RelayLimiter(),
+    roster: () => readRoster({}), stderr: l => { errs.push(l) },
+  }, req)
+  let work: Promise<void> | undefined
+  await runReply({ ...replyDeps(stubApi().api, makeTee({ dir, bot: () => 'MK_VeraBot' }), 4096), relay, settled: w => { work = w } },
+    { chat_id: GROUP, text: '@maya and @MK_GradyBot, look', message_thread_id: 40 })
+  await work
+  expect(r.calls.length).toBe(0)
+  expect(lines(join(dir, 'MK_VeraBot.jsonl'))[0].relayed).toEqual([
+    { to: 'Grady', skipped: 'no-roster' }, { to: 'Maya', skipped: 'no-roster' },
+  ])
+  expect(errs.join('')).toContain('roster')
+})
+
+test('relay: the roster is $FLEET_HANDOFF_AGENTS, and an empty one is no roster', () => {
+  expect(readRoster({ FLEET_HANDOFF_AGENTS: 'Vera Maya Grady Taiichi Werner' })).toEqual(ROSTER)
+  expect(readRoster({ FLEET_HANDOFF_AGENTS: '  ' })).toBeUndefined()
+  expect(readRoster({})).toBeUndefined()
+})
+
+test('relay: the server hands relayTags the real roster', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('const relay = (req: RelayRequest) => relayTags({')
+  expect(src.slice(start, src.indexOf('}, req)', start))).toContain('roster: () => readRoster(),')
 })

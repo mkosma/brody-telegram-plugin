@@ -31,7 +31,7 @@ import { tapToast, type TapOutcome } from './tap-toast.ts'
 import { runReply, runEditMessage } from './reply.ts'
 import { makeTee, teeInbound, TEE_DIR } from './post-log.ts'
 import { groupDecision, type GroupPolicy } from './group-gate.ts'
-import { relayTags, RelayLimiter, spawnRunner, type RelayRequest } from './tag-relay.ts'
+import { relayTags, RelayLimiter, spawnRunner, readRoster, type RelayRequest } from './tag-relay.ts'
 import { runEditForumTopic } from './forum-topic.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -129,6 +129,7 @@ const relay = (req: RelayRequest) => relayTags({
   title: id => groupTitles.get(id),
   run: spawnRunner,
   limiter: relayLimiter,
+  roster: () => readRoster(),
 }, req)
 
 // --- Typing keepalive ----------------------------------------------------
