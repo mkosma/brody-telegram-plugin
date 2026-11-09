@@ -309,6 +309,11 @@ def main(argv):
         print("no node_modules here; run `bun install` first", file=sys.stderr)
         return 2
     want = set(argv)
+    # An id that names no revert would run nothing and report green.
+    unknown = want - {r[0] for r in REVERTS}
+    if unknown:
+        print("unknown revert id(s): %s" % " ".join(sorted(unknown)), file=sys.stderr)
+        return 2
     bad = 0
     with tempfile.TemporaryDirectory(prefix="bridge-revert-") as base:
         d = os.path.join(base, "baseline")
