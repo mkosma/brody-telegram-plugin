@@ -38,6 +38,7 @@ import { relayTags, RelayLimiter, spawnRunner, readRoster, type RelayRequest } f
 import { runEditForumTopic } from './forum-topic.ts'
 import { openTapped, tappedLabel, type OmfTapDeps } from './omf-tap.ts'
 import { parsePageTap, runPageTap } from './page-tap.ts'
+import { isHeadless, headlessDecision, DmReplyLimiter, conflictSleepMs } from './headless.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -70,6 +71,9 @@ try {
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
+// Headless (headless.ts): a launchd poller with no session. Agent mode is
+// every line below with HEADLESS false, unchanged.
+const HEADLESS = isHeadless(process.env)
 
 if (!TOKEN) {
   process.stderr.write(
@@ -112,7 +116,8 @@ process.on('uncaughtException', err => {
 // Strict: no bare yes/no (conversational), no prefix/suffix chatter.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
-const bot = new Bot(TOKEN)
+// TELEGRAM_API_ROOT points the bridge at a fake Bot API, for the drills only.
+const bot = new Bot(TOKEN, process.env.TELEGRAM_API_ROOT ? { client: { apiRoot: process.env.TELEGRAM_API_ROOT } } : undefined)
 let botUsername = ''
 
 // The post log (spec item 1): every group post this bot sends or receives, one
@@ -375,7 +380,8 @@ function checkApprovals(): void {
   }
 }
 
-if (!STATIC) setInterval(checkApprovals, 5000).unref()
+// Headless never pairs anyone, so it has no approval to confirm.
+if (!STATIC && !HEADLESS) setInterval(checkApprovals, 5000).unref()
 
 const mcp = new Server(
   { name: 'telegram', version: '1.0.0' },
@@ -659,7 +665,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
-await mcp.connect(new StdioServerTransport())
+if (!HEADLESS) await mcp.connect(new StdioServerTransport())
 
 // When Claude Code closes the MCP connection, stdin gets EOF. Without this
 // the bot keeps polling forever as a zombie, holding the token and blocking
@@ -677,23 +683,49 @@ function shutdown(): void {
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(bot.stop()).finally(() => process.exit(0))
 }
-process.stdin.on('end', shutdown)
-process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 process.on('SIGHUP', shutdown)
 
-// Orphan watchdog: stdin events above don't reliably fire when the parent
-// chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
-// reparenting (POSIX) or a dead stdin pipe and self-terminate.
-const bootPpid = process.ppid
-setInterval(() => {
-  const orphaned =
-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
-    process.stdin.destroyed ||
-    process.stdin.readableEnded
-  if (orphaned) shutdown()
-}, 5000).unref()
+// A session's bridge ends with its session. A headless bridge has no session:
+// under launchd stdin is /dev/null and the parent is launchd, so both checks
+// below would end it at once and KeepAlive would flap it.
+if (!HEADLESS) {
+  process.stdin.on('end', shutdown)
+  process.stdin.on('close', shutdown)
+
+  // Orphan watchdog: stdin events above don't reliably fire when the parent
+  // chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
+  // reparenting (POSIX) or a dead stdin pipe and self-terminate.
+  const bootPpid = process.ppid
+  setInterval(() => {
+    const orphaned =
+      (process.platform !== 'win32' && process.ppid !== bootPpid) ||
+      process.stdin.destroyed ||
+      process.stdin.readableEnded
+    if (orphaned) shutdown()
+  }, 5000).unref()
+}
+
+// Headless: one gate in front of every handler below (headless.ts). A tap the
+// server-side handlers serve passes to them unchanged; a DM from allowFrom gets
+// the fixed line; everything else is dropped, and nothing reaches a session.
+const dmReplyLimiter = new DmReplyLimiter()
+if (HEADLESS) bot.use(async (ctx, next) => {
+  const action = headlessDecision({
+    callbackData: ctx.callbackQuery?.data,
+    isCallback: ctx.callbackQuery != null,
+    isMessage: ctx.message != null,
+    chatType: ctx.chat?.type,
+    fromId: ctx.from?.id,
+  }, loadAccess().allowFrom, dmReplyLimiter, Date.now())
+  if (action.kind === 'pass') return next()
+  if (action.kind === 'refuse-tap') {
+    await ctx.answerCallbackQuery({ text: action.toast }).catch(() => {})
+    return
+  }
+  if (action.kind === 'dm-reply') await ctx.reply(action.text)
+})
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
 // /status to other group members, (2) confirm bot presence in non-allowlisted
@@ -1364,8 +1396,9 @@ void (async () => {
         onStart: info => {
           attempt = 0
           botUsername = info.username
-          process.stderr.write(`telegram channel: polling as @${info.username}\n`)
-          void bot.api.setMyCommands(
+          process.stderr.write(`telegram channel: polling as @${info.username}${HEADLESS ? ' (headless)' : ''}\n`)
+          // Headless has no commands: a DM gets the fixed line whatever it says.
+          if (!HEADLESS) void bot.api.setMyCommands(
             [
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
@@ -1381,6 +1414,18 @@ void (async () => {
       // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
       if (err instanceof Error && err.message === 'Aborted delay') return
       const is409 = err instanceof GrammyError && err.error_code === 409
+      if (is409 && HEADLESS) {
+        // One poller per token. Never fight the holder, and never exit fast
+        // enough for launchd to relaunch straight into the same 409.
+        const ms = conflictSleepMs(process.env)
+        process.stderr.write(
+          `telegram channel: 409 Conflict - another poller holds this token. ` +
+          `Headless: not retrying; exiting 0 in ${ms / 1000}s.\n`,
+        )
+        await new Promise(r => setTimeout(r, ms))
+        shutdown()
+        return
+      }
       if (is409 && attempt >= 8) {
         process.stderr.write(
           `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
