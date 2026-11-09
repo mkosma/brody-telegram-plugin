@@ -30,6 +30,7 @@ import { join, sep, basename } from 'path'
 import { tapToast, type TapOutcome } from './tap-toast.ts'
 import { runReply, runEditMessage } from './reply.ts'
 import { makeTee, teeInbound, TEE_DIR } from './post-log.ts'
+import { groupDecision, type GroupPolicy } from './group-gate.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -149,11 +150,6 @@ type PendingEntry = {
   createdAt: number
   expiresAt: number
   replies: number
-}
-
-type GroupPolicy = {
-  requireMention: boolean
-  allowFrom: string[]
 }
 
 type Access = {
@@ -321,18 +317,12 @@ function gate(ctx: Context): GateResult {
   }
 
   if (chatType === 'group' || chatType === 'supergroup') {
-    const groupId = String(ctx.chat!.id)
-    const policy = access.groups[groupId]
-    if (!policy) return { action: 'drop' }
-    const groupAllowFrom = policy.allowFrom ?? []
-    const requireMention = policy.requireMention ?? true
-    if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
-      return { action: 'drop' }
-    }
-    if (requireMention && !isMentioned(ctx, access.mentionPatterns)) {
-      return { action: 'drop' }
-    }
-    return { action: 'deliver', access }
+    // requireMention can be set per thread (groups[id].threads[thread_id]);
+    // see group-gate.ts. access.json is re-read here on every message.
+    const policy = access.groups[String(ctx.chat!.id)]
+    return groupDecision(policy, senderId, ctx.message, botUsername, access.mentionPatterns) === 'deliver'
+      ? { action: 'deliver', access }
+      : { action: 'drop' }
   }
 
   return { action: 'drop' }
@@ -349,32 +339,6 @@ function dmCommandGate(ctx: Context): { access: Access; senderId: string } | nul
   if (access.dmPolicy === 'disabled') return null
   if (access.dmPolicy === 'allowlist' && !access.allowFrom.includes(senderId)) return null
   return { access, senderId }
-}
-
-function isMentioned(ctx: Context, extraPatterns?: string[]): boolean {
-  const entities = ctx.message?.entities ?? ctx.message?.caption_entities ?? []
-  const text = ctx.message?.text ?? ctx.message?.caption ?? ''
-  for (const e of entities) {
-    if (e.type === 'mention') {
-      const mentioned = text.slice(e.offset, e.offset + e.length)
-      if (mentioned.toLowerCase() === `@${botUsername}`.toLowerCase()) return true
-    }
-    if (e.type === 'text_mention' && e.user?.is_bot && e.user.username === botUsername) {
-      return true
-    }
-  }
-
-  // Reply to one of our messages counts as an implicit mention.
-  if (ctx.message?.reply_to_message?.from?.username === botUsername) return true
-
-  for (const pat of extraPatterns ?? []) {
-    try {
-      if (new RegExp(pat, 'i').test(text)) return true
-    } catch {
-      // Invalid user-supplied regex — skip it.
-    }
-  }
-  return false
 }
 
 // `edit-telegram-access <Agent> pair` drops a file at approved/<senderId> when it pairs

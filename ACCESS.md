@@ -64,6 +64,14 @@ edit-telegram-access Vera group-remove -1001654782309
 
 `mention` only changes a group that is already enabled; it never adds one. Re-running `group-add` on an enabled group resets `requireMention` and keeps the group's member list.
 
+**Per thread.** A forum topic (or any thread) can override the group's `requireMention`. The thread setting wins for that thread only; the General topic carries no thread id and always uses the group setting. A tag, a reply to the bot, or a `mentionPatterns` match still counts as a mention.
+
+```
+edit-telegram-access Vera thread -1001654782309 39 --require-mention
+edit-telegram-access Vera thread -1001654782309 39 --no-require-mention
+edit-telegram-access Vera thread -1001654782309 39 --clear
+```
+
 To restrict which members can trigger the bot in a group, set that group's `"allowFrom"` list by hand in `access.json`. There is no command for it yet.
 
 **Privacy mode.** Telegram bots default to a server-side privacy mode that filters group messages before they reach your code: only @mentions and replies are delivered. This matches the default `requireMention: true`, so it's normally invisible. Using `--no-mention` requires disabling privacy mode as well: message [@BotFather](https://t.me/BotFather), send `/setprivacy`, pick your bot, choose **Disable**. Without that step, Telegram never delivers the messages regardless of local config.
@@ -107,6 +115,7 @@ The outbound keys below have no command yet. Set them by hand in that bot's `acc
 | `edit-telegram-access Vera group-add -1001654782309` | Enable a group. Flag: `--no-mention` (also requires disabling privacy mode). |
 | `edit-telegram-access Vera group-remove -1001654782309` | Disable a group. |
 | `edit-telegram-access Vera mention -1001654782309 on` | Set `requireMention` on an enabled group: `on` or `off`. |
+| `edit-telegram-access Vera thread -1001654782309 39 --require-mention` | Override `requireMention` for one thread of an enabled group. `--no-require-mention` lifts it; `--clear` removes the override. |
 
 Every write prints the entry it changed. Exit codes: `0` changed (or listed), `1` refused with nothing written, `2` usage. A corrupt `access.json` is refused, never overwritten.
 
@@ -136,7 +145,9 @@ Every write prints the entry it changed. Exit codes: `0` changed (or listed), `1
       // false also requires disabling privacy mode via BotFather.
       "requireMention": true,
       // Restrict triggers to these senders. Empty = any member (subject to requireMention).
-      "allowFrom": []
+      "allowFrom": [],
+      // Optional per-thread override, keyed by message_thread_id.
+      "threads": { "39": { "requireMention": true } }
     }
   },
 

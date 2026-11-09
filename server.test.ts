@@ -218,3 +218,50 @@ test('inbound log: a delivered group message says delivered:true, and a DM write
   const got = lines(join(dir, 'MK_TestBot.jsonl'))
   expect(got.map(l => [l.message_id, l.delivered, l.thread_id])).toEqual([[8, true, null]])
 })
+
+// --- Spec item 2: per-topic mention gate -----------------------------------
+// Acceptance 3.
+
+import { groupDecision, requireMentionFor, type GroupPolicy } from './group-gate.ts'
+
+const BOT = 'MK_VeraBot'
+const fleet: GroupPolicy = { requireMention: false, allowFrom: [], threads: { '39': { requireMention: true } } }
+const post = (text: string, thread?: number) => {
+  const at = text.indexOf('@')
+  return {
+    text,
+    ...(thread != null ? { message_thread_id: thread } : {}),
+    entities: at >= 0 ? [{ type: 'mention', offset: at, length: text.length - at }] : [],
+  }
+}
+
+test('thread gate: group off, thread 39 on', () => {
+  expect(groupDecision(fleet, '111', post('what is playing', 39), BOT)).toBe('drop')
+  expect(groupDecision(fleet, '111', post('what is playing @MK_VeraBot', 39), BOT)).toBe('deliver')
+  expect(groupDecision(fleet, '111', post('what is playing', 40), BOT)).toBe('deliver')
+  expect(groupDecision(fleet, '111', post('what is playing'), BOT)).toBe('deliver')
+})
+
+test('thread gate: a reply to the bot in a gated thread still delivers', () => {
+  const m = { text: 'yes', message_thread_id: 39, reply_to_message: { from: { username: BOT } } }
+  expect(groupDecision(fleet, '111', m, BOT)).toBe('deliver')
+})
+
+test('thread gate: a thread entry can also lift a group-wide requirement', () => {
+  const p: GroupPolicy = { requireMention: true, allowFrom: [], threads: { '40': { requireMention: false } } }
+  expect(requireMentionFor(p, 40)).toBe(false)
+  expect(requireMentionFor(p, 39)).toBe(true)
+  expect(requireMentionFor(p, undefined)).toBe(true)
+  // A thread entry with no requireMention falls through to the group.
+  expect(requireMentionFor({ requireMention: false, allowFrom: [], threads: { '39': {} } }, 39)).toBe(false)
+})
+
+test('inbound log + thread gate: an untagged post in a gated thread is logged delivered:false', () => {
+  const dir = teeDir()
+  const tee = makeTee({ dir, bot: () => BOT })
+  const m = { message_id: 12, ...post('untagged', 39) }
+  const r = teeInbound({ message: m, chat: groupChat, from: monty, text: m.text, tee },
+    () => ({ action: groupDecision(fleet, '111', m, BOT) }))
+  expect(r.action).toBe('drop')
+  expect(lines(join(dir, `${BOT}.jsonl`)).map(l => [l.message_id, l.thread_id, l.delivered])).toEqual([[12, 39, false]])
+})
