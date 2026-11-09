@@ -11,6 +11,7 @@ import { statSync } from 'fs'
 import { basename, extname } from 'path'
 import { InputFile } from 'grammy'
 import { isGroupChatId, outEntry, safeTee, type Tee } from './post-log.ts'
+import type { RelayOutcome, RelayRequest } from './tag-relay.ts'
 
 export const MAX_CHUNK_LIMIT = 4096
 export const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -25,7 +26,7 @@ export type ReplyAccess = {
   chunkMode?: 'length' | 'newline'
 }
 
-type Sent = { message_id: number }
+type Sent = { message_id: number; entities?: Array<{ type: string; offset: number; length: number }> }
 
 export type ReplyApi = {
   sendMessage(chat_id: string, text: string, other?: Record<string, unknown>): Promise<Sent>
@@ -41,10 +42,24 @@ export type ReplyDeps = {
   stopTyping: (chat_id: string) => void
   /** The post log. Absent means no logging; a throwing one never fails a send. */
   tee?: Tee
+  /**
+   * The tag relay. Called once, after the whole reply went out to a group.
+   * Returns undefined when there is nothing to relay. Never awaited by the
+   * reply: the outcome lands in the post log when it settles.
+   */
+  relay?: (req: RelayRequest) => Promise<RelayOutcome[]> | undefined
+  /** Test hook: handed the background work (relay, then log) when there is some. */
+  settled?: (work: Promise<void>) => void
 }
 
 // One record per message id Telegram gave back, in send order.
-type SentPost = { message_id: number; text: string; reply_to?: number }
+type SentPost = {
+  message_id: number
+  text: string
+  reply_to?: number
+  entities?: Sent['entities']
+  file?: boolean
+}
 
 // Telegram caps messages at 4096 chars. Split long replies, preferring
 // paragraph boundaries when chunkMode is 'newline'.
@@ -153,7 +168,12 @@ export async function runReply(
           ...(chunkKeyboard ? { reply_markup: chunkKeyboard } : {}),
         })
         sentIds.push(sent.message_id)
-        posts.push({ message_id: sent.message_id, text: chunks[i], ...(shouldReplyTo ? { reply_to } : {}) })
+        posts.push({
+          message_id: sent.message_id,
+          text: chunks[i],
+          entities: sent.entities,
+          ...(shouldReplyTo ? { reply_to } : {}),
+        })
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -177,21 +197,43 @@ export async function runReply(
       if (PHOTO_EXTS.has(ext)) {
         const sent = await api.sendPhoto(chat_id, input, Object.keys(opts).length ? opts : undefined)
         sentIds.push(sent.message_id)
-        posts.push({ message_id: sent.message_id, text: `(photo: ${basename(f)})`, ...fileReplyTo })
+        posts.push({ message_id: sent.message_id, text: `(photo: ${basename(f)})`, file: true, ...fileReplyTo })
       } else {
         const sent = await api.sendDocument(chat_id, input, Object.keys(opts).length ? opts : undefined)
         sentIds.push(sent.message_id)
-        posts.push({ message_id: sent.message_id, text: `(document: ${basename(f)})`, ...fileReplyTo })
+        posts.push({ message_id: sent.message_id, text: `(document: ${basename(f)})`, file: true, ...fileReplyTo })
       }
     }
   }
 
+  let ok = false
   try {
     await sendAll()
+    ok = true
   } finally {
     if (isGroupChatId(chat_id)) {
-      for (const p of posts) {
-        safeTee(deps.tee, outEntry({ chat_id, thread_id: message_thread_id, ...p, edit: false }))
+      const entries = posts.map(p => outEntry({
+        chat_id, thread_id: message_thread_id, message_id: p.message_id, reply_to: p.reply_to, text: p.text, edit: false,
+      }))
+      const writeAll = () => { for (const e of entries) safeTee(deps.tee, e) }
+      // Relay only a reply that went out whole, and only its text.
+      let relaying: Promise<RelayOutcome[]> | undefined
+      if (ok && deps.relay) {
+        try {
+          relaying = deps.relay({ chat_id, thread_id: message_thread_id, posts: posts.filter(p => !p.file) })
+        } catch (err) {
+          process.stderr.write(`telegram channel: tag relay failed to start: ${err}\n`)
+        }
+      }
+      if (!relaying) {
+        writeAll()
+      } else {
+        // The outcome rides the post's first line: relayed: [{to, rc}].
+        const work = relaying.then(
+          outcomes => { if (entries[0]) entries[0].relayed = outcomes },
+          err => { if (entries[0]) entries[0].relayed = [{ error: String(err) }] },
+        ).finally(writeAll)
+        deps.settled?.(work)
       }
     }
   }

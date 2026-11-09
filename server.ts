@@ -31,6 +31,7 @@ import { tapToast, type TapOutcome } from './tap-toast.ts'
 import { runReply, runEditMessage } from './reply.ts'
 import { makeTee, teeInbound, TEE_DIR } from './post-log.ts'
 import { groupDecision, type GroupPolicy } from './group-gate.ts'
+import { relayTags, RelayLimiter, spawnRunner, type RelayRequest } from './tag-relay.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -113,6 +114,21 @@ let botUsername = ''
 // JSON line each, in a file named for this bot. Local disk only; a failed write
 // is one stderr line and never touches the send.
 const tee = makeTee({ dir: TEE_DIR, bot: () => botUsername })
+
+// The tag relay (spec item 3): a group post of ours that tags another fleet
+// agent's bot (MK_<Name>Bot) is delivered to that agent as a `dispatch send`
+// from ours. Group titles are learned from inbound messages, for the subject
+// line only; the relay never calls the API to look one up. The rate bound is
+// per process, so it resets when the bridge restarts.
+const groupTitles = new Map<string, string>()
+const relayLimiter = new RelayLimiter()
+const relay = (req: RelayRequest) => relayTags({
+  sender: ACCESS_AGENT,
+  ownBot: () => botUsername,
+  title: id => groupTitles.get(id),
+  run: spawnRunner,
+  limiter: relayLimiter,
+}, req)
 
 // --- Typing keepalive ----------------------------------------------------
 // Telegram's "typing…" indicator (sendChatAction) auto-expires after ~5s, so a
@@ -575,7 +591,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     switch (req.params.name) {
       case 'reply':
         return await runReply(
-          { api: bot.api, loadAccess, assertAllowedChat, assertSendable, stopTyping, tee },
+          { api: bot.api, loadAccess, assertAllowedChat, assertSendable, stopTyping, tee, relay },
           args,
         )
       case 'react': {
@@ -1095,6 +1111,8 @@ async function handleInbound(
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
 ): Promise<void> {
+  if (ctx.chat && 'title' in ctx.chat && ctx.chat.title) groupTitles.set(String(ctx.chat.id), ctx.chat.title)
+
   // Logged whatever the gate decides, so a post the gate drops is still on the
   // record (delivered:false). Groups only; teeInbound skips a DM.
   const result = teeInbound(

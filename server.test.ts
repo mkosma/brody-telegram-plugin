@@ -98,10 +98,10 @@ function stubApi() {
   }
 }
 
-function replyDeps(api: ReturnType<typeof stubApi>['api'], tee?: (e: Record<string, unknown>) => void) {
+function replyDeps(api: ReturnType<typeof stubApi>['api'], tee?: (e: Record<string, unknown>) => void, textChunkLimit = 10) {
   return {
     api,
-    loadAccess: () => ({ textChunkLimit: 10 }),
+    loadAccess: () => ({ textChunkLimit }),
     assertAllowedChat: () => {},
     assertSendable: () => {},
     stopTyping: () => {},
@@ -264,4 +264,158 @@ test('inbound log + thread gate: an untagged post in a gated thread is logged de
     () => ({ action: groupDecision(fleet, '111', m, BOT) }))
   expect(r.action).toBe('drop')
   expect(lines(join(dir, `${BOT}.jsonl`)).map(l => [l.message_id, l.thread_id, l.delivered])).toEqual([[12, 39, false]])
+})
+
+// --- Spec item 3: tag relay ------------------------------------------------
+// Acceptance 4.
+
+import { writeFileSync as fsWrite, chmodSync as fsChmod } from 'fs'
+import { relayTags, RelayLimiter, spawnRunner, botAgent, tagsIn, type Runner, type RelayRequest } from './tag-relay.ts'
+
+function fakeRunner(rcFor: (argv: string[]) => number = () => 0) {
+  const calls: Array<{ argv: string[]; stdin?: string }> = []
+  const run: Runner = async (argv, stdin) => { calls.push({ argv, stdin }); return { rc: rcFor(argv), stderr: '' } }
+  return { calls, run, sends: () => calls.filter(c => c.argv[1] === 'send') }
+}
+
+function relayFor(run: Runner, limiter = new RelayLimiter(), errs: string[] = []) {
+  return (req: RelayRequest) => relayTags({
+    sender: 'Vera', ownBot: () => 'MK_VeraBot', title: () => 'Fleet', run, limiter, stderr: l => { errs.push(l) },
+  }, req)
+}
+
+const tagged = (text: string) => ({ chat_id: GROUP, thread_id: 39, posts: [{ message_id: 600, text }] })
+
+test('relay: a post tagging @MK_MayaBot calls dispatch send --to agent:Maya once', async () => {
+  const r = fakeRunner()
+  const outcomes = await relayFor(r.run)(tagged('@MK_MayaBot what is playing in the kitchen?'))
+  expect(r.sends().length).toBe(1)
+  const argv = r.sends()[0].argv
+  expect(argv.slice(0, 4)).toEqual(['dispatch', 'send', '--to', 'agent:Maya'])
+  expect(argv).toContain('--from')
+  expect(argv[argv.indexOf('--from') + 1]).toBe('Vera')
+  expect(argv[argv.indexOf('--tier') + 1]).toBe('2')
+  expect(argv[argv.indexOf('--subject') + 1]).toBe('Telegram tag from Vera in Fleet/39')
+  expect(argv.slice(-2)).toEqual(['--body', '-'])
+  const body = r.sends()[0].stdin ?? ''
+  for (const s of ['what is playing in the kitchen?', `chat_id: ${GROUP}`, 'thread_id: 39', 'message_id: 600']) {
+    expect(body).toContain(s)
+  }
+  // The roster was asked first, and only about Maya.
+  expect(r.calls[0].argv).toEqual(['dispatch', 'resolve', '--to', 'agent:Maya'])
+  expect(outcomes).toEqual([{ to: 'Maya', rc: 0 }])
+})
+
+test("relay: tagging the bridge's own bot calls nothing", () => {
+  const r = fakeRunner()
+  expect(relayFor(r.run)(tagged('note to self @MK_VeraBot'))).toBeUndefined()
+  expect(r.calls.length).toBe(0)
+})
+
+test('relay: tagging @EmmaBrodybot calls nothing', () => {
+  const r = fakeRunner()
+  expect(relayFor(r.run)(tagged('hey @EmmaBrodybot'))).toBeUndefined()
+  expect(r.calls.length).toBe(0)
+})
+
+test('relay: the 7th relay in an hour to one recipient is skipped and logged', async () => {
+  const dir = teeDir()
+  const r = fakeRunner()
+  const errs: string[] = []
+  const relay = relayFor(r.run, new RelayLimiter(), errs)
+  const tee = makeTee({ dir, bot: () => 'MK_VeraBot' })
+  for (let i = 0; i < 7; i++) {
+    let work: Promise<void> | undefined
+    const res = await runReply({ ...replyDeps(stubApi().api, tee, 4096), relay, settled: w => { work = w } },
+      { chat_id: GROUP, text: '@MK_MayaBot ok', message_thread_id: 39 })
+    expect(res.content[0].text).toBe('sent (id: 500)')
+    await work
+  }
+  expect(r.sends().length).toBe(6)
+  const got = lines(join(dir, 'MK_VeraBot.jsonl'))
+  expect(got.length).toBe(7)
+  expect(got.slice(0, 6).every(l => JSON.stringify(l.relayed) === JSON.stringify([{ to: 'Maya', rc: 0 }]))).toBe(true)
+  expect(got[6].relayed).toEqual([{ to: 'Maya', skipped: 'rate' }])
+  expect(errs.length).toBe(1)
+  expect(errs[0]).toContain('Vera -> Maya skipped')
+})
+
+test('relay: the limit is per pair and rolls off after an hour', () => {
+  let t = 0
+  const lim = new RelayLimiter(6, () => t)
+  for (let i = 0; i < 6; i++) expect(lim.take('Vera', 'Maya')).toBe(true)
+  expect(lim.take('Vera', 'Maya')).toBe(false)
+  expect(lim.take('Vera', 'Grady')).toBe(true)
+  expect(lim.take('Maya', 'Vera')).toBe(true)
+  t = 60 * 60 * 1000 + 1
+  expect(lim.take('Vera', 'Maya')).toBe(true)
+})
+
+test('relay: a name the roster rejects is not sent', async () => {
+  const r = fakeRunner(argv => (argv[1] === 'resolve' ? 3 : 0))
+  expect(await relayFor(r.run)(tagged('@MK_PageBot hello'))).toEqual([{ to: 'Page', skipped: 'roster' }])
+  expect(r.sends().length).toBe(0)
+})
+
+test('relay: a refused identity (dispatch exit 7) is recorded and reported, not retried', async () => {
+  const errs: string[] = []
+  const r = fakeRunner(argv => (argv[1] === 'send' ? 7 : 0))
+  expect(await relayFor(r.run, new RelayLimiter(), errs)(tagged('@MK_MayaBot hi'))).toEqual([{ to: 'Maya', rc: 7 }])
+  expect(r.sends().length).toBe(1)
+  expect(errs.join('')).toContain('refused the sender identity')
+})
+
+test('relay: an unverified agent name never signs a send', async () => {
+  const r = fakeRunner()
+  const out = await relayTags({ sender: '<Agent>', ownBot: () => 'MK_VeraBot', title: () => undefined, run: r.run, limiter: new RelayLimiter(), stderr: () => {} },
+    tagged('@MK_MayaBot hi'))
+  expect(out).toEqual([{ to: 'Maya', skipped: 'sender-unverified' }])
+  expect(r.calls.length).toBe(0)
+})
+
+test('relay: never blocks the send, and a DM is never relayed', async () => {
+  const hang: Runner = () => new Promise(() => {})
+  let work: Promise<void> | undefined
+  const res = await runReply({ ...replyDeps(stubApi().api, undefined, 4096), relay: relayFor(hang), settled: w => { work = w } },
+    { chat_id: GROUP, text: '@MK_MayaBot hi' })
+  expect(res.content[0].text).toBe('sent (id: 500)')
+  expect(work).toBeDefined()
+  const r = fakeRunner()
+  await runReply({ ...replyDeps(stubApi().api, undefined, 4096), relay: relayFor(r.run) }, { chat_id: DM, text: '@MK_MayaBot hi' })
+  expect(r.calls.length).toBe(0)
+})
+
+test("relay: uses the sent message's mention entities, else @tokens", () => {
+  // Entities present: only what Telegram marked as a mention counts.
+  expect(tagsIn('mail me at x@MK_MayaBot or @MK_GradyBot', [{ type: 'mention', offset: 27, length: 12 }])).toEqual(['MK_GradyBot'])
+  expect(tagsIn('@MK_MayaBot and @MK_GradyBot, not a@b.com')).toEqual(['MK_MayaBot', 'MK_GradyBot'])
+  expect(botAgent('MK_MayaBot')).toBe('Maya')
+  expect(botAgent('mk_taiichibot')).toBe('Taiichi')
+  expect(botAgent('EmmaBrodybot')).toBeUndefined()
+})
+
+test('relay: the real runner passes argv and stdin to the process, and kills it at the timeout', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'relay-run-'))
+  const fake = join(d, 'dispatch')
+  fsWrite(fake, `#!/bin/sh\nprintf '%s\\n' "$@" > "${d}/argv"\ncat > "${d}/stdin"\n[ "$2" = hang ] && sleep 30\nexit 0\n`)
+  fsChmod(fake, 0o755)
+  expect((await spawnRunner([fake, 'send', '--to', 'agent:Maya'], 'the body', 5000)).rc).toBe(0)
+  expect(readFileSync(join(d, 'argv'), 'utf8')).toBe('send\n--to\nagent:Maya\n')
+  expect(readFileSync(join(d, 'stdin'), 'utf8')).toBe('the body')
+  const t0 = Date.now()
+  expect((await spawnRunner([fake, 'x', 'hang'], '', 300)).rc).toBe(124)
+  expect(Date.now() - t0).toBeLessThan(3000)
+  expect((await spawnRunner([join(d, 'no-such-binary')], '', 1000)).rc).toBe(127)
+})
+
+// Monty's tags are not relayed: the relay hangs off the reply tool only, so
+// nothing on the inbound path may call it.
+test('relay: the inbound path never relays', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('async function handleInbound(')
+  const end = src.indexOf('\n}\n', start)
+  expect(start).toBeGreaterThan(-1)
+  const body = src.slice(start, end)
+  expect(body).toContain('teeInbound(')
+  expect(body).not.toMatch(/\brelay\w*\s*\(|relayLimiter/)
 })
