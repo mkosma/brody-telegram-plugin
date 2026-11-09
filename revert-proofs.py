@@ -6,7 +6,8 @@ each feature's core line and show that its test goes red. Extended for
 SPEC-bridge-names-invite-excuse-2026-11-09 (ids N*, L*, I*), whose every
 acceptance case carries a revert that goes red. Extended again for
 SPEC-on-call-agents-wake-and-sleep-2026-11-09, "The wake check" (ids W*),
-and for DESIGN-page-tuned-2026-10-05 rule 5, Page's buttons (ids K*).
+for DESIGN-page-tuned-2026-10-05 rule 5, Page's buttons (ids K*), and for
+RULING-page-taps-need-a-poller-2026-11-09, the headless poller (ids H*).
 
 Each revert is applied to a COPY of this tree in a temp dir (node_modules is
 symlinked in), never to the tree itself. A revert whose text is not found
@@ -357,6 +358,50 @@ REVERTS = [
      "  if (rc === RC.TIMEOUT) return { outcome: 'failed', toast: `Couldn't confirm ${id}: no answer in ${PAGE_TAP_TIMEOUT_MS / 1000}s` }\n",
      "",
      "page tap: a timeout says it could not confirm, and keeps the row"),
+    # RULING-page-taps-need-a-poller-2026-11-09: the headless poller (ids H*)
+    # H1 is two edits: with no MCP transport reading stdin, the stdin
+    # handlers alone never see EOF, so that guard reverted by itself stays
+    # green. Measured, not assumed: it was a MISS as a single edit.
+    ("H1", "headless: EOF", "server.ts",
+     ("if (!HEADLESS) await mcp.connect(", "if (!HEADLESS) {\n  process.stdin.on('end', shutdown)"),
+     ("if (true) await mcp.connect(", "if (true) {\n  process.stdin.on('end', shutdown)"),
+     "headless bridge: stdin EOF does not end it; it keeps polling and exits 0 on SIGTERM"),
+    ("H2", "headless: EOF", "server.ts",
+     "const HEADLESS = isHeadless(process.env)\n",
+     "const HEADLESS = false\n",
+     "headless bridge: stdin EOF does not end it; it keeps polling and exits 0 on SIGTERM"),
+    ("H3", "agent: EOF", "server.ts",
+     "if (!HEADLESS) {\n  process.stdin.on('end', shutdown)",
+     "if (false) {\n  process.stdin.on('end', shutdown)",
+     "agent-mode bridge: stdin EOF ends it, exit 0"),
+    ("H4", "headless: 409", "server.ts",
+     "      if (is409 && HEADLESS) {",
+     "      if (false) {",
+     "headless bridge: a 409 is logged once, never retried, and exits 0 after the sleep"),
+    ("H5", "headless: once an hour", "headless.ts",
+     "    if (prev !== undefined && now - prev < this.everyMs) return false\n",
+     "",
+     "headless bridge: taps reach the existing handlers, a DM gets one fixed reply, the rest is dropped"),
+    ("H6", "headless: DM allowFrom", "headless.ts",
+     "    if (!from || !allowFrom.includes(from)) return { kind: 'drop', why: 'dm-not-allowed' }\n",
+     "",
+     "headless bridge: taps reach the existing handlers, a DM gets one fixed reply, the rest is dropped"),
+    ("H7", "headless: taps pass", "server.ts",
+     "  if (action.kind === 'pass') return next()\n",
+     "  if (action.kind === 'pass') return\n",
+     "headless bridge: taps reach the existing handlers, a DM gets one fixed reply, the rest is dropped"),
+    ("H8", "headless: no spinner", "server.ts",
+     "    await ctx.answerCallbackQuery({ text: action.toast }).catch(() => {})\n    return\n",
+     "    return\n",
+     "headless bridge: taps reach the existing handlers, a DM gets one fixed reply, the rest is dropped"),
+    ("H9", "headless: no menu", "server.ts",
+     "          if (!HEADLESS) void bot.api.setMyCommands(",
+     "          void bot.api.setMyCommands(",
+     "headless bridge: stdin EOF does not end it; it keeps polling and exits 0 on SIGTERM"),
+    ("H10", "headless: only its taps", "headless.ts",
+     "    if (u.callbackData !== undefined && servedHeadless(u.callbackData)) return { kind: 'pass' }\n",
+     "    return { kind: 'pass' }\n",
+     "headless: any other tap is answered, never passed and never left spinning"),
 ]
 
 FAIL_RE = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)
@@ -403,12 +448,19 @@ def main(argv):
             copy_tree(d)
             path = os.path.join(d, fname)
             src = open(path).read()
-            n = src.count(orig)
-            if n != 1:
-                print("%s %-16s ERROR: revert text found %d times in %s" % (rid, feature, n, fname))
+            # A revert is one edit, or a tuple of edits applied together when
+            # the behavior rests on more than one line (H1).
+            pairs = list(zip(orig, rev)) if isinstance(orig, tuple) else [(orig, rev)]
+            missing = [(o, src.count(o)) for o, _ in pairs if src.count(o) != 1]
+            if missing:
+                print("%s %-16s ERROR: revert text found %d times in %s" % (rid, feature, missing[0][1], fname))
                 bad += 1
                 continue
-            open(path, "w").write(src.replace(orig, rev))
+            for o, r in pairs:
+                src = src.replace(o, r)
+            open(path, "w").write(src)
+            if isinstance(orig, tuple):
+                orig = orig[0]
             rc, fails, _ = run_tests(d)
             red = rc != 0 and must_fail in fails
             print("%s %-16s %s  rc=%d  %s: %r reverted -> red: %s" % (
