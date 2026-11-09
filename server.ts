@@ -37,6 +37,7 @@ import { inboundDecision, inboundText, safeName, parseEnvFile, ALLOWED_UPDATES }
 import { relayTags, RelayLimiter, spawnRunner, readRoster, type RelayRequest } from './tag-relay.ts'
 import { runEditForumTopic } from './forum-topic.ts'
 import { openTapped, tappedLabel, type OmfTapDeps } from './omf-tap.ts'
+import { parsePageTap, runPageTap } from './page-tap.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -810,6 +811,28 @@ bot.on('callback_query:data', async ctx => {
     if (msg && 'text' in msg && msg.text) {
       await ctx.editMessageText(`${msg.text}\n\n${label}`).catch(() => {})
     }
+    return
+  }
+
+  // Page's Done / Not now: callback_data `pg:done:<id>` / `pg:later:<id>`.
+  // Rule 5 of DESIGN-page-tuned-2026-10-05. Served here, like omf: below, so
+  // a tap never waits on an agent's turn: `interrupt tap` records it, its
+  // first stderr line is the toast, and the item's row is then taken off
+  // the tapped message (page-tap.ts). allowFrom only.
+  const pageTap = parsePageTap(data)
+  if (pageTap) {
+    const accessPage = loadAccess()
+    const userId = String(ctx.from.id)
+    if (!accessPage.allowFrom.includes(userId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    await runPageTap({
+      run: spawnRunner,
+      answer: toast => ctx.answerCallbackQuery({ text: toast }),
+      editMarkup: markup => ctx.editMessageReplyMarkup({ reply_markup: markup as any }),
+      stderr: s => process.stderr.write(s),
+    }, { ...pageTap, userId, markup: ctx.callbackQuery.message?.reply_markup as any })
     return
   }
 

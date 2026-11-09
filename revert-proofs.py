@@ -5,7 +5,8 @@ Spec SPEC-bridge-tee-topic-gate-tag-relay-2026-11-09, acceptance 6: revert
 each feature's core line and show that its test goes red. Extended for
 SPEC-bridge-names-invite-excuse-2026-11-09 (ids N*, L*, I*), whose every
 acceptance case carries a revert that goes red. Extended again for
-SPEC-on-call-agents-wake-and-sleep-2026-11-09, "The wake check" (ids W*).
+SPEC-on-call-agents-wake-and-sleep-2026-11-09, "The wake check" (ids W*),
+and for DESIGN-page-tuned-2026-10-05 rule 5, Page's buttons (ids K*).
 
 Each revert is applied to a COPY of this tree in a temp dir (node_modules is
 symlinked in), never to the tree itself. A revert whose text is not found
@@ -319,6 +320,43 @@ REVERTS = [
      "        allowed_updates: [...ALLOWED_UPDATES],",
      "        allowed_updates: ['message'],",
      "server wiring: polls ALLOWED_UPDATES and takes every handler text from inboundText"),
+    # DESIGN-page-tuned-2026-10-05, rule 5: Page's Done / Not now buttons
+    ("K1", "page: parse", "page-tap.ts",
+     "  const m = /^pg:(done|later):(P[0-9]{4,6})$/.exec(data)",
+     "  const m = /^pg:(done|later|[a-z]+):(P[0-9]{4,6}.*)$/.exec(data)",
+     "page tap: only pg:done:<id> and pg:later:<id> parse"),
+    ("K2", "page: argv", "page-tap.ts",
+     "'tap', tap.verb, tap.id, '--tg-user', tap.userId]",
+     "'tap', tap.verb, tap.id]",
+     "page tap: Done runs interrupt tap with the id and tapper, toasts its line, then drops the row"),
+    ("K3", "page: order", "page-tap.ts",
+     "  try {\n    await deps.answer(res.toast)\n  } catch (e) {\n    deps.stderr(`page tap: toast not sent: ${e}\\n`)\n  }\n",
+     "",
+     "page tap: Done runs interrupt tap with the id and tapper, toasts its line, then drops the row"),
+    ("K4", "page: desk keep", "page-tap.ts",
+     "  if (res.outcome === 'done' || res.outcome === 'later' || res.outcome === 'closed') {",
+     "  if (true) {",
+     "page tap: Done refused on the desk keeps the row and says why"),
+    ("K5", "page: no path", "page-tap.ts",
+     "  const said = cut(stripPaths(firstLine(stderr)), TOAST_MAX)",
+     "  const said = cut(firstLine(stderr), TOAST_MAX)",
+     "page tap: a failure toasts its reason with no path, and keeps the row"),
+    ("K6", "page: styles", "page-tap.ts",
+     "    .map(row => row.map(b => ({ ...b, style: styleFor(b) })))",
+     "    .map(row => row.map(b => ({ ...b })))",
+     "page tap: a kept keyboard re-states every style"),
+    ("K7", "page: safe", "page-tap.ts",
+     "  } catch (e) {\n      deps.stderr(`page tap: keyboard not updated: ${e}\\n`)\n    }\n",
+     "  } finally {}\n",
+     "page tap: a failed toast or edit never rejects"),
+    ("K8", "page: allowFrom", "server.ts",
+     "    if (!accessPage.allowFrom.includes(userId)) {\n",
+     "    if (false) {\n",
+     "page tap: the server handler is allowFrom-gated, served before the generic path, and answers through runPageTap"),
+    ("K9", "page: timeout", "page-tap.ts",
+     "  if (rc === RC.TIMEOUT) return { outcome: 'failed', toast: `Couldn't confirm ${id}: no answer in ${PAGE_TAP_TIMEOUT_MS / 1000}s` }\n",
+     "",
+     "page tap: a timeout says it could not confirm, and keeps the row"),
 ]
 
 FAIL_RE = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)

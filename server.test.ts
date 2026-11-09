@@ -855,3 +855,139 @@ test('omf: the server handler opens through openTapped, with the tapped message\
   expect(body).toContain("thread_id: tapped && 'message_thread_id' in tapped ? tapped.message_thread_id : undefined")
   expect(body).not.toMatch(/(?<!\.)\bexec\(/)
 })
+
+// --- Page Done / Not now (DESIGN-page-tuned-2026-10-05, rule 5) --------------
+import { parsePageTap, runPageTap, withoutItem, tapResult, INTERRUPT_BIN, PAGE_TAP_TIMEOUT_MS, type Markup } from './page-tap.ts'
+
+function pageDeps(rc: number, stderr: string) {
+  const calls: { argv: string[]; timeout: number }[] = []
+  const answers: string[] = []
+  const edits: unknown[] = []
+  const errs: string[] = []
+  const order: string[] = []
+  return {
+    calls, answers, edits, errs, order,
+    deps: {
+      run: async (argv: string[], _stdin: string | undefined, timeout: number) => {
+        calls.push({ argv, timeout }); order.push('run'); return { rc, stderr }
+      },
+      answer: async (t: string) => { answers.push(t); order.push('answer') },
+      editMarkup: async (m: unknown) => { edits.push(m); order.push('edit') },
+      stderr: (s: string) => { errs.push(s) },
+    },
+  }
+}
+
+const DIGEST_MARKUP: Markup = {
+  inline_keyboard: [
+    [{ text: 'P0007 Review: the spec', callback_data: 'omf:aaaaaaaa' }],
+    [{ text: '✓ Done P0007', callback_data: 'pg:done:P0007' }, { text: 'Not now', callback_data: 'pg:later:P0007' }],
+    [{ text: '✓ Done P0003', callback_data: 'pg:done:P0003', style: 'success' }, { text: 'Not now', callback_data: 'pg:later:P0003', style: 'primary' }],
+  ],
+}
+
+test('page tap: only pg:done:<id> and pg:later:<id> parse', () => {
+  expect(parsePageTap('pg:done:P0123')).toEqual({ verb: 'done', id: 'P0123' })
+  expect(parsePageTap('pg:later:P012345')).toEqual({ verb: 'later', id: 'P012345' })
+  for (const bad of ['pg:done:P12', 'pg:nuke:P0123', 'pg:done:P0123;rm', 'pg:done:P0123 ', 'omf:abcdef', 'pg:done:p0123']) {
+    expect(parsePageTap(bad)).toBeUndefined()
+  }
+})
+
+test('page tap: Done runs interrupt tap with the id and tapper, toasts its line, then drops the row', async () => {
+  const h = pageDeps(0, 'P0007 done\n')
+  const r = await runPageTap(h.deps, { verb: 'done', id: 'P0007', userId: '42', markup: DIGEST_MARKUP })
+  expect(h.calls).toEqual([{ argv: [INTERRUPT_BIN, 'tap', 'done', 'P0007', '--tg-user', '42'], timeout: PAGE_TAP_TIMEOUT_MS }])
+  expect(r.outcome).toBe('done')
+  expect(h.answers).toEqual(['P0007 done'])
+  expect(h.order).toEqual(['run', 'answer', 'edit'])
+  const kb = (h.edits[0] as { inline_keyboard: { callback_data: string }[][] }).inline_keyboard
+  expect(kb.flat().map(b => b.callback_data)).toEqual(['omf:aaaaaaaa', 'pg:done:P0003', 'pg:later:P0003'])
+})
+
+test('page tap: Not now toasts until when and drops the row', async () => {
+  const h = pageDeps(0, 'P0003 hidden until Thu 9:14am\n')
+  const r = await runPageTap(h.deps, { verb: 'later', id: 'P0003', userId: '42', markup: DIGEST_MARKUP })
+  expect(r.outcome).toBe('later')
+  expect(h.calls[0].argv.slice(1, 4)).toEqual(['tap', 'later', 'P0003'])
+  expect(h.answers).toEqual(['P0003 hidden until Thu 9:14am'])
+  expect(h.edits.length).toBe(1)
+})
+
+test('page tap: an already-closed item toasts so and drops the row', async () => {
+  const h = pageDeps(3, 'P0007 is already closed\n')
+  const r = await runPageTap(h.deps, { verb: 'done', id: 'P0007', userId: '42', markup: DIGEST_MARKUP })
+  expect(r.outcome).toBe('closed')
+  expect(h.answers).toEqual(['P0007 is already closed'])
+  expect(h.edits.length).toBe(1)
+})
+
+test('page tap: Done refused on the desk keeps the row and says why', async () => {
+  const h = pageDeps(4, 'P0007 is still on your desk; it clears when the document leaves\n')
+  const r = await runPageTap(h.deps, { verb: 'done', id: 'P0007', userId: '42', markup: DIGEST_MARKUP })
+  expect(r.outcome).toBe('refused')
+  expect(h.answers[0]).toContain('still on your desk')
+  expect(h.edits).toEqual([])
+})
+
+test('page tap: a timeout says it could not confirm, and keeps the row', async () => {
+  const h = pageDeps(124, '')
+  const r = await runPageTap(h.deps, { verb: 'done', id: 'P0007', userId: '42', markup: DIGEST_MARKUP })
+  expect(r.outcome).toBe('failed')
+  expect(h.answers).toEqual([`Couldn't confirm P0007: no answer in ${PAGE_TAP_TIMEOUT_MS / 1000}s`])
+  expect(h.edits).toEqual([])
+})
+
+test('page tap: a failure toasts its reason with no path, and keeps the row', async () => {
+  const h = pageDeps(1, 'page: CANONICAL STORE UNREACHABLE - recording a tap did not happen at /Volumes/maxi/.agents/Page/items.jsonl\n')
+  const r = await runPageTap(h.deps, { verb: 'done', id: 'P0007', userId: '42', markup: DIGEST_MARKUP })
+  expect(r.outcome).toBe('failed')
+  expect(h.answers[0]).toStartWith("Couldn't record P0007: page: CANONICAL STORE UNREACHABLE")
+  expect(h.answers[0]).not.toContain('/Volumes')
+  expect(h.answers[0].length).toBeLessThanOrEqual(190)
+  expect(h.edits).toEqual([])
+  expect(h.errs.join('')).toContain('rc=1')
+})
+
+test('page tap: a kept keyboard re-states every style', () => {
+  const kb = withoutItem(DIGEST_MARKUP, 'P0003').inline_keyboard
+  expect(kb.flat().map(b => [b.callback_data, b.style])).toEqual([
+    ['omf:aaaaaaaa', 'primary'], ['pg:done:P0007', 'success'], ['pg:later:P0007', 'primary'],
+  ])
+  expect(withoutItem({ inline_keyboard: [[{ callback_data: 'pg:done:P0001' }, { callback_data: 'pg:later:P0001' }]] }, 'P0001'))
+    .toEqual({ inline_keyboard: [] })
+})
+
+test('page tap: a failed toast or edit never rejects', async () => {
+  const h = pageDeps(0, 'P0007 done\n')
+  const deps = { ...h.deps, answer: async () => { throw new Error('query is too old') }, editMarkup: async () => { throw new Error('message is not modified') } }
+  const r = await runPageTap(deps, { verb: 'done', id: 'P0007', userId: '42', markup: DIGEST_MARKUP })
+  expect(r.outcome).toBe('done')
+  expect(h.errs.join('')).toContain('toast not sent')
+  expect(h.errs.join('')).toContain('keyboard not updated')
+})
+
+test('page tap: tapResult never returns an empty toast', () => {
+  for (const rc of [0, 3, 4, 124, 1, 127]) {
+    expect(tapResult('done', 'P0001', rc, '').toast.length).toBeGreaterThan(0)
+  }
+})
+
+test('page tap: the server handler is allowFrom-gated, served before the generic path, and answers through runPageTap', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('const pageTap = parsePageTap(data)')
+  const end = src.indexOf('const omfMatch = ', start)
+  expect(start).toBeGreaterThan(-1)
+  expect(end).toBeGreaterThan(start)
+  const generic = src.indexOf('// Feature 3: General inline keyboard callback')
+  expect(start).toBeLessThan(generic)
+  const body = src.slice(start, end)
+  const gate = body.indexOf('if (!accessPage.allowFrom.includes(userId)) {')
+  const run = body.indexOf('await runPageTap({')
+  expect(gate).toBeGreaterThan(-1)
+  expect(run).toBeGreaterThan(gate)
+  expect(body.slice(gate, run)).toContain('return')
+  expect(body).toContain('answer: toast => ctx.answerCallbackQuery({ text: toast }),')
+  expect(body).toContain('run: spawnRunner,')
+  expect(body).not.toContain('mcp.notification')
+})
