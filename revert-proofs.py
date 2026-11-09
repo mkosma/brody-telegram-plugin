@@ -2,7 +2,9 @@
 """revert-proofs.py - every feature's test can fail.
 
 Spec SPEC-bridge-tee-topic-gate-tag-relay-2026-11-09, acceptance 6: revert
-each feature's core line and show that its test goes red.
+each feature's core line and show that its test goes red. Extended for
+SPEC-bridge-names-invite-excuse-2026-11-09 (ids N*, L*, I*), whose every
+acceptance case carries a revert that goes red.
 
 Each revert is applied to a COPY of this tree in a temp dir (node_modules is
 symlinked in), never to the tree itself. A revert whose text is not found
@@ -71,6 +73,23 @@ REVERTS = [
      "(err as { description?: string }).description ?? ",
      "",
      "edit_forum_topic: on error returns the API's own description"),
+    # SPEC-bridge-names-invite-excuse-2026-11-09, item 1
+    ("N1", "@name mention", "group-gate.ts",
+     "  if (nameMentionPattern(agent)?.test(text)) return true\n",
+     "",
+     "name mention: @vera, @Vera, and hi @vera match; @verabot, x@vera.com and @veranda do not"),
+    ("N2", "@name mention", "group-gate.ts",
+     "  return new RegExp(`(^|[^\\\\w@])@${agent}(?![\\\\w])`, 'i')",
+     "  return new RegExp(`@${agent}`, 'i')",
+     "name mention: @vera, @Vera, and hi @vera match; @verabot, x@vera.com and @veranda do not"),
+    ("N3", "@name mention", "group-gate.ts",
+     "  if (!agent || !/^[A-Za-z][A-Za-z0-9]*$/.test(agent)) return undefined\n",
+     "  if (!agent) return undefined\n",
+     "name mention: an unverified name has no pattern"),
+    ("N4", "@name mention", "server.ts",
+     "access.mentionPatterns, ACCESS_AGENT) === 'deliver'",
+     "access.mentionPatterns) === 'deliver'",
+     "name mention: gate() passes the bridge's agent name to groupDecision"),
 ]
 
 FAIL_RE = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)

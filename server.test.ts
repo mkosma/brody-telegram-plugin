@@ -451,3 +451,36 @@ test('edit_forum_topic: gated by assertAllowedChat before any API call', async (
     .rejects.toThrow('not allowlisted')
   expect(called).toBe(false)
 })
+
+// --- SPEC-bridge-names-invite-excuse-2026-11-09 -----------------------------
+// Item 1: @<name> counts as a mention. Acceptance 1.
+
+import { nameMentionPattern, isMentioned } from './group-gate.ts'
+
+test('name mention: @vera, @Vera, and hi @vera match; @verabot, x@vera.com and @veranda do not', () => {
+  const m = (text: string) => isMentioned({ text }, 'MK_VeraBot', undefined, 'Vera')
+  for (const t of ['@vera', '@Vera,', 'hi @vera', 'hey @vera, look', '(@VERA)']) expect([t, m(t)]).toEqual([t, true])
+  for (const t of ['@verabot', 'x@vera.com', '@veranda', 'vera', '@@vera', '@vera_x']) expect([t, m(t)]).toEqual([t, false])
+})
+
+test('name mention: an unverified name has no pattern', () => {
+  expect(nameMentionPattern('<Agent>')).toBeUndefined()
+  expect(nameMentionPattern('')).toBeUndefined()
+  expect(nameMentionPattern(undefined)).toBeUndefined()
+  expect(isMentioned({ text: '@<Agent> hi' }, 'MK_VeraBot', undefined, '<Agent>')).toBe(false)
+})
+
+test('name mention: the gate delivers @vera in a mention-only thread', () => {
+  expect(groupDecision(fleet, '111', { text: 'what is playing @vera', message_thread_id: 39 }, BOT, undefined, 'Vera')).toBe('deliver')
+  expect(groupDecision(fleet, '111', { text: 'what is playing @veranda', message_thread_id: 39 }, BOT, undefined, 'Vera')).toBe('drop')
+})
+
+// server.ts cannot be imported (it starts the bot), so the one wiring line is
+// checked in the source: the gate hands the verified agent name to the group
+// decision.
+test("name mention: gate() passes the bridge's agent name to groupDecision", () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('function gate(ctx: Context)')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  expect(body).toMatch(/groupDecision\([^)]*access\.mentionPatterns, ACCESS_AGENT\)/)
+})

@@ -337,7 +337,7 @@ function gate(ctx: Context): GateResult {
     // requireMention can be set per thread (groups[id].threads[thread_id]);
     // see group-gate.ts. access.json is re-read here on every message.
     const policy = access.groups[String(ctx.chat!.id)]
-    return groupDecision(policy, senderId, ctx.message, botUsername, access.mentionPatterns) === 'deliver'
+    return groupDecision(policy, senderId, ctx.message, botUsername, access.mentionPatterns, ACCESS_AGENT) === 'deliver'
       ? { action: 'deliver', access }
       : { action: 'drop' }
   }
