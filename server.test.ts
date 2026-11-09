@@ -776,3 +776,80 @@ test('phrases: the server answers invite with an arrive phrase and excuse with a
   expect(src).toContain("phrase: verb => phrasePicker.pick(verb === 'invite' ? 'arrive' : 'depart'),")
   expect(src).toContain('file: phrasesFile(ACCESS_AGENT),')
 })
+
+// --- omf: tap failure reply --------------------------------------------------
+// A failed or timed-out open-markdown-file posts one line into the tapped
+// message's chat and thread; success posts nothing. Stubbed runner and API.
+import { openTapped, tappedLabel, stripPaths, failureReason, OMF_BIN, OMF_TIMEOUT_MS, REASON_MAX, type OmfTapDeps } from './omf-tap.ts'
+
+function omfHarness(result: { rc: number; stderr: string }) {
+  const runs: Array<{ argv: string[]; timeoutMs: number }> = []
+  const sends: Array<{ chat_id: string; text: string; thread_id?: number }> = []
+  const deps: OmfTapDeps = {
+    run: async (argv, _stdin, timeoutMs) => { runs.push({ argv, timeoutMs }); return result },
+    send: async (chat_id, text, thread_id) => { sends.push({ chat_id, text, thread_id }) },
+    stderr: () => {},
+  }
+  return { deps, runs, sends }
+}
+const omfTap = { target: '/Users/monty/WIP/Vera/working/SPEC-x.md', label: '📄 The spec for x', chat_id: '-1001234', thread_id: 40 }
+
+test('omf: a failed open posts once, in the tapped chat and thread, with the label and no path', async () => {
+  const h = omfHarness({ rc: 2, stderr: "open-markdown-file: no such file '/Users/monty/WIP/Vera/working/SPEC-x.md' (checked /Users/monty/memex)\nsecond line\n" })
+  expect(await openTapped(h.deps, omfTap)).toBe('failed')
+  expect(h.runs).toEqual([{ argv: [OMF_BIN, omfTap.target, '--clicked', '--quiet'], timeoutMs: OMF_TIMEOUT_MS }])
+  expect(h.sends.length).toBe(1)
+  const s = h.sends[0]
+  expect(s.chat_id).toBe('-1001234')
+  expect(s.thread_id).toBe(40)
+  expect(s.text).toBe("Couldn't open 📄 The spec for x: open-markdown-file: no such file (checked )")
+  expect(s.text).not.toMatch(/\/Users|\/monty|SPEC-x|second line/)
+})
+
+test('omf: a timed-out open posts once, saying it timed out', async () => {
+  const h = omfHarness({ rc: 124, stderr: '' })
+  expect(await openTapped(h.deps, omfTap)).toBe('failed')
+  expect(h.sends.length).toBe(1)
+  expect(h.sends[0].text).toBe(`Couldn't open 📄 The spec for x: timed out after ${OMF_TIMEOUT_MS / 1000}s`)
+})
+
+test('omf: a successful open posts nothing', async () => {
+  const h = omfHarness({ rc: 0, stderr: 'warning: /Users/monty/x noisy but fine\n' })
+  expect(await openTapped(h.deps, omfTap)).toBe('opened')
+  expect(h.runs.length).toBe(1)
+  expect(h.sends.length).toBe(0)
+})
+
+test('omf: a failed reply send never throws and never re-runs the open', async () => {
+  const h = omfHarness({ rc: 1, stderr: 'boom\n' })
+  h.deps.send = async () => { throw new Error('429') }
+  expect(await openTapped(h.deps, omfTap)).toBe('failed')
+  expect(h.runs.length).toBe(1)
+})
+
+test('omf: reason is the first stderr line, paths stripped, at most 120 characters', () => {
+  expect(stripPaths('cannot open ~/WIP/x.md or "/Users/monty/Mobile Documents/y.md" and/or WIP:Vera/z.md')).toBe('cannot open or and/or WIP:Vera/z.md')
+  expect(stripPaths('not found:/Users/monty/x.md')).toBe('not found:')
+  const long = failureReason(1, `${'e'.repeat(300)} /Users/monty/x\n`)
+  expect(long.length).toBeLessThanOrEqual(REASON_MAX)
+  expect(long.endsWith('…')).toBe(true)
+  expect(failureReason(3, '\n  \n')).toBe('exited 3')
+  expect(failureReason(3, '/Users/monty/only/a/path\n')).toBe('exited 3')
+})
+
+test('omf: the label is the tapped button text, found by its callback data', () => {
+  const markup = { inline_keyboard: [[{ text: 'Other', callback_data: 'omf:aaaaaa' }], [{ text: 'The spec', callback_data: 'omf:bbbbbb' }]] }
+  expect(tappedLabel('omf:bbbbbb', markup)).toBe('The spec')
+  expect(tappedLabel('omf:cccccc', markup)).toBeUndefined()
+})
+
+test('omf: the server handler opens through openTapped, with the tapped message\'s chat and thread', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('const omfMatch = ')
+  const end = src.indexOf('const openMatch = ', start)
+  const body = src.slice(start, end)
+  expect(body).toContain('void openTapped(omfTapDeps, {')
+  expect(body).toContain('chat_id: tapped ? String(tapped.chat.id) : undefined')
+  expect(body).toContain("thread_id: tapped && 'message_thread_id' in tapped ? tapped.message_thread_id : undefined")
+  expect(body).not.toMatch(/(?<!\.)\bexec\(/)
+})

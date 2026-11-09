@@ -29,12 +29,13 @@ import { homedir } from 'os'
 import { join, sep, basename } from 'path'
 import { tapToast, type TapOutcome } from './tap-toast.ts'
 import { runReply, runEditMessage } from './reply.ts'
-import { makeTee, teeInbound, safeTee, outEntry, TEE_DIR } from './post-log.ts'
+import { makeTee, teeInbound, safeTee, outEntry, isGroupChatId, TEE_DIR } from './post-log.ts'
 import { planGroupCommand, runGroupCommand, type CommandDeps, type CommandPlan } from './invite-excuse.ts'
 import { PhrasePicker, phrasesFile } from './phrases.ts'
 import { groupDecision, type GroupPolicy } from './group-gate.ts'
 import { relayTags, RelayLimiter, spawnRunner, readRoster, type RelayRequest } from './tag-relay.ts'
 import { runEditForumTopic } from './forum-topic.ts'
+import { openTapped, tappedLabel, type OmfTapDeps } from './omf-tap.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -760,6 +761,17 @@ bot.command('status', async ctx => {
 //   perm:allow/deny/more:<id>  — permission relay (internal)
 //   anything else             — Feature 3: surface to Claude as a channel event
 // Security mirrors the text-reply path: allowFrom must contain the sender.
+// The omf: handler's open, and its one failure reply, posted like the
+// bridge's /invite answer: into the thread, logged when it is a group.
+const omfTapDeps: OmfTapDeps = {
+  run: spawnRunner,
+  send: async (chat_id, text, thread_id) => {
+    const sent = await bot.api.sendMessage(chat_id, text, thread_id != null ? { message_thread_id: thread_id } : {})
+    if (isGroupChatId(chat_id)) safeTee(tee, outEntry({ chat_id, thread_id, message_id: sent.message_id, text, edit: false }))
+  },
+  stderr: s => process.stderr.write(s),
+}
+
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   const permMatch = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
@@ -856,17 +868,21 @@ bot.on('callback_query:data', async ctx => {
     // ACKNOWLEDGE FIRST, THEN DO THE WORK. Monty asked for feedback that the
     // click landed; the toast is the feedback and it must not wait on obsidian.
     await ctx.answerCallbackQuery({ text: `Opening ${target.split('/').pop()}` }).catch(() => {})
-    const { exec } = await import('node:child_process')
-    const sqOmf = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
     // --clicked: a tap IS the click, so this is mode (a) - the document goes
     // into the ACTIVE tab and Obsidian comes forward. Without it the script
     // probes, and a tap made while he is working in Obsidian would open the
     // document QUIETLY in the background - correct for an unsolicited open and
     // wrong for one he just asked for.
-    exec(`/Users/monty/.local/bin/open-markdown-file ${sqOmf(target)} --clicked --quiet`,
-      { timeout: 15000 }, (err, _o, stderr) => {
-        if (err) process.stderr.write(`omf open failed: ${err.message} ${stderr}\n`)
-      })
+    //
+    // A failed or timed-out open posts one line into the tapped message's
+    // chat and thread (omf-tap.ts). Not awaited: the tap is already answered.
+    const tapped = ctx.callbackQuery.message
+    void openTapped(omfTapDeps, {
+      target,
+      label: tappedLabel(data, tapped?.reply_markup),
+      chat_id: tapped ? String(tapped.chat.id) : undefined,
+      thread_id: tapped && 'message_thread_id' in tapped ? tapped.message_thread_id : undefined,
+    })
     return
   }
 
