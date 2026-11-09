@@ -5,7 +5,8 @@
  * Spec item 2 (SPEC-bridge-tee-topic-gate-tag-relay-2026-11-09): a group can
  * set requireMention per thread. A thread entry overrides the group's setting
  * for that thread only. A message in a forum's General topic carries no
- * message_thread_id, so it takes the group setting.
+ * message_thread_id; it takes the "general" thread entry when there is one
+ * (SPEC-bridge-names-invite-excuse-2026-11-09 item 2), else the group setting.
  *
  * SPEC-bridge-names-invite-excuse-2026-11-09, item 1: `@<name>` for this
  * bridge's agent counts as a mention with no configuration.
@@ -16,7 +17,7 @@ export type ThreadPolicy = { requireMention?: boolean }
 export type GroupPolicy = {
   requireMention: boolean
   allowFrom: string[]
-  /** Keyed by message_thread_id as a string. */
+  /** Keyed by message_thread_id as a string, or "general" for the General topic. */
   threads?: Record<string, ThreadPolicy>
 }
 
@@ -31,8 +32,18 @@ export type GateMessage = {
   reply_to_message?: { from?: { username?: string } }
 }
 
+/**
+ * The key a thread's entry is stored under: its message_thread_id, or
+ * "general" for a post with none (a forum's General topic). Without the
+ * "general" key an /invite there could only be written to the group setting,
+ * which would open every topic.
+ */
+export function threadKey(threadId: number | undefined): string {
+  return threadId != null ? String(threadId) : 'general'
+}
+
 export function requireMentionFor(policy: GroupPolicy, threadId: number | undefined): boolean {
-  const thread = threadId != null ? policy.threads?.[String(threadId)] : undefined
+  const thread = policy.threads?.[threadKey(threadId)]
   return thread?.requireMention ?? policy.requireMention ?? true
 }
 

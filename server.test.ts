@@ -556,3 +556,223 @@ test('relay: the server hands relayTags the real roster', () => {
   const start = src.indexOf('const relay = (req: RelayRequest) => relayTags({')
   expect(src.slice(start, src.indexOf('}, req)', start))).toContain('roster: () => readRoster(),')
 })
+
+// Item 2: /invite and /excuse. Acceptance 3-7.
+
+import { planGroupCommand, runGroupCommand, parseGroupCommand, applyGroupCommand, STATIC_ANSWER, type CommandDeps, type CommandAccess, type CommandMessage } from './invite-excuse.ts'
+import { PhrasePicker, phrasesFile, PHRASE_MAX_WORDS } from './phrases.ts'
+
+const MONTY = 111
+const THREAD = 40
+
+function commandRig(opts: { agent?: string; bot?: string; access?: CommandAccess; isStatic?: boolean } = {}) {
+  let stored: CommandAccess = structuredClone(opts.access ?? { allowFrom: [String(MONTY)], groups: {} })
+  const saves: CommandAccess[] = []
+  const answers: Array<{ chat_id: string; text: string; thread_id?: number }> = []
+  const events: Array<{ verb: string; key: string }> = []
+  const deps: CommandDeps = {
+    agent: opts.agent ?? 'Grady',
+    botUsername: () => opts.bot ?? 'MK_GradyBot',
+    isStatic: opts.isStatic ?? false,
+    phrase: verb => (verb === 'invite' ? 'ARRIVE' : 'DEPART'),
+    loadAccess: () => structuredClone(stored),
+    saveAccess: a => { if (opts.isStatic) return; stored = structuredClone(a); saves.push(structuredClone(a)) },
+    answer: async (chat_id, text, thread_id) => { answers.push({ chat_id, text, ...(thread_id != null ? { thread_id } : {}) }) },
+    notify: (verb, key) => { events.push({ verb, key }) },
+    stderr: () => {},
+  }
+  // The same composition server.ts uses: plan synchronously, then run.
+  // thread null is the General topic (no message_thread_id).
+  const send = async (text: string, thread: number | null = THREAD, from: CommandMessage['from'] = { id: MONTY }) => {
+    const plan = planGroupCommand(deps, { chat_id: GROUP, chat_type: 'supergroup', from, text, ...(thread != null ? { message_thread_id: thread } : {}) })
+    if (plan.kind === 'act') return runGroupCommand(deps, plan)
+    return plan.kind
+  }
+  return { deps, send, saves, answers, events, access: () => stored }
+}
+
+test('invite: /invite @grady from Monty in thread 40 sets thread 40 open in Grady\'s access, and answers once', async () => {
+  const fleetOn = { allowFrom: [String(MONTY)], groups: { [GROUP]: { requireMention: true, allowFrom: [], threads: {} } } }
+  const g = commandRig({ access: fleetOn })
+  expect(await g.send('/invite @grady')).toBe('changed')
+  expect(g.access().groups[GROUP].threads?.['40']).toEqual({ requireMention: false })
+  expect(g.saves.length).toBe(1)
+  expect(g.answers).toEqual([{ chat_id: GROUP, text: 'ARRIVE', thread_id: 40 }])
+  expect(g.events).toEqual([{ verb: 'invite', key: '40' }])
+  // Telegram's own form, and a name list naming the bot twice, still answer once.
+  for (const t of ['/invite@MK_GradyBot', '/invite @Grady @MK_GradyBot', '/invite @vera @grady']) {
+    const h = commandRig({ access: fleetOn })
+    expect([t, await h.send(t)]).toEqual([t, 'changed'])
+    expect(h.answers.length).toBe(1)
+  }
+})
+
+test('invite: from a non-allowFrom user it does nothing and sends no answer', async () => {
+  const g = commandRig()
+  expect(await g.send('/invite @grady', THREAD, { id: 222 })).toBe('ignore')
+  expect(await g.send('/invite @grady', THREAD, { id: MONTY, is_bot: true })).toBe('ignore')
+  expect(g.saves.length + g.answers.length + g.events.length).toBe(0)
+})
+
+test('invite: /invite @vera leaves Grady\'s access unchanged, and a nameless /invite does nothing', async () => {
+  const g = commandRig()
+  expect(await g.send('/invite @vera')).toBe('ignore')
+  expect(await g.send('/invite@MK_VeraBot')).toBe('ignore')
+  expect(await g.send('/invite')).toBe('ignore')
+  expect(await g.send('/invite grady')).toBe('ignore')
+  expect(g.saves.length + g.answers.length + g.events.length).toBe(0)
+  expect(g.access()).toEqual({ allowFrom: [String(MONTY)], groups: {} })
+  // Not a command at all: the ordinary gate decides.
+  expect(await g.send('/invitation @grady')).toBe('none')
+  expect(await g.send('please /invite @grady')).toBe('none')
+  expect(planGroupCommand(g.deps, { chat_id: DM, chat_type: 'private', from: { id: MONTY }, text: '/invite @grady' }).kind).toBe('none')
+})
+
+test('invite: into a group not yet enabled creates it mention-only with one thread open; a second writes nothing and answers the same', async () => {
+  const g = commandRig()
+  expect(await g.send('/invite @grady')).toBe('changed')
+  expect(g.access().groups[GROUP]).toEqual({ requireMention: true, allowFrom: [], threads: { '40': { requireMention: false } } })
+  expect(await g.send('/invite @grady')).toBe('unchanged')
+  expect(g.saves.length).toBe(1)
+  expect(g.answers.map(a => a.text)).toEqual(['ARRIVE', 'ARRIVE'])
+  expect(g.events.length).toBe(2)
+})
+
+test('excuse: /excuse @grady sets the entry true; then an untagged post in 40 drops and @grady delivers', async () => {
+  const g = commandRig()
+  await g.send('/invite @grady')
+  const gradyGate = (text: string) => groupDecision(g.access().groups[GROUP], '111', { text, message_thread_id: THREAD }, 'MK_GradyBot', undefined, 'Grady')
+  expect(gradyGate('untagged')).toBe('deliver')
+  expect(await g.send('/excuse @grady')).toBe('changed')
+  expect(g.access().groups[GROUP].threads?.['40']).toEqual({ requireMention: true })
+  expect(g.access().groups[GROUP]).toBeDefined()
+  expect(g.answers.map(a => a.text)).toEqual(['ARRIVE', 'DEPART'])
+  expect(g.events.map(e => e.verb)).toEqual(['invite', 'excuse'])
+  expect(gradyGate('untagged')).toBe('drop')
+  expect(gradyGate('@grady are you there?')).toBe('deliver')
+  // Already excused: the same answer, nothing written. No group: nothing created.
+  expect(await g.send('/excuse @grady')).toBe('unchanged')
+  expect(g.saves.length).toBe(2)
+  const h = commandRig()
+  expect(await h.send('/excuse @grady')).toBe('unchanged')
+  expect(h.access().groups).toEqual({})
+  expect(h.answers.map(a => a.text)).toEqual(['DEPART'])
+})
+
+test('invite: in General keys "general", and an untagged post in thread 40 is still dropped', async () => {
+  const g = commandRig()
+  expect(await g.send('/invite @grady', null)).toBe('changed')
+  expect(g.access().groups[GROUP]).toEqual({ requireMention: true, allowFrom: [], threads: { general: { requireMention: false } } })
+  expect(g.answers).toEqual([{ chat_id: GROUP, text: 'ARRIVE' }])
+  expect(g.events).toEqual([{ verb: 'invite', key: 'general' }])
+  const policy = g.access().groups[GROUP]
+  expect(groupDecision(policy, '111', { text: 'untagged' }, 'MK_GradyBot', undefined, 'Grady')).toBe('deliver')
+  expect(groupDecision(policy, '111', { text: 'untagged', message_thread_id: THREAD }, 'MK_GradyBot', undefined, 'Grady')).toBe('drop')
+})
+
+test('invite: in STATIC mode the bot answers that it cannot, and nothing claims the change', async () => {
+  const g = commandRig({ isStatic: true })
+  expect(await g.send('/invite @grady')).toBe('static')
+  expect(g.answers).toEqual([{ chat_id: GROUP, text: STATIC_ANSWER, thread_id: 40 }])
+  expect(STATIC_ANSWER).toBe("I can't change my settings in this mode.")
+  expect(g.events.length).toBe(0)
+  expect(g.saves.length).toBe(0)
+})
+
+test('invite: a failed access.json write says nothing and tells nobody', async () => {
+  const g = commandRig()
+  g.deps.saveAccess = () => { throw new Error('EACCES') }
+  expect(await g.send('/invite @grady')).toBe('failed')
+  expect(g.answers.length + g.events.length).toBe(0)
+})
+
+test('invite: parse and apply are case-blind about names and keep other thread settings', () => {
+  expect(parseGroupCommand('/Invite @Grady @VERA')).toEqual({ verb: 'invite', names: ['grady', 'vera'] })
+  expect(parseGroupCommand('/excuse@MK_GradyBot')).toEqual({ verb: 'excuse', names: ['mk_gradybot'] })
+  expect(parseGroupCommand('/invite x@grady.com')).toEqual({ verb: 'invite', names: [] })
+  const a: CommandAccess = { allowFrom: [], groups: { [GROUP]: { requireMention: false, allowFrom: ['9'], threads: { '39': { requireMention: true } } } } }
+  expect(applyGroupCommand(a, GROUP, '40', 'invite')).toBe(true)
+  expect(a.groups[GROUP]).toEqual({ requireMention: false, allowFrom: ['9'], threads: { '39': { requireMention: true }, '40': { requireMention: false } } })
+})
+
+test('invite: an unverified agent name acts only on its bot username', async () => {
+  const g = commandRig({ agent: '<Agent>' })
+  expect(await g.send('/invite @<Agent>')).toBe('ignore')
+  expect(await g.send('/invite @grady')).toBe('ignore')
+  expect(await g.send('/invite @MK_GradyBot')).toBe('changed')
+})
+
+// The server wiring, checked in the source because server.ts cannot be imported.
+test('invite: handleInbound plans the command before gate() and never delivers it as chat', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('async function handleInbound(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const plan = body.indexOf('planGroupCommand(')
+  const early = body.indexOf("if (command.kind !== 'none') {")
+  const gateAt = body.indexOf('gate(ctx)')
+  expect(plan).toBeGreaterThan(-1)
+  expect(early).toBeGreaterThan(plan)
+  expect(gateAt).toBeGreaterThan(early)
+  expect(body.slice(early, gateAt)).toContain('return\n')
+  expect(body).toContain('text: ctx.message?.text,')
+})
+
+test('invite: the MCP instructions tell the agent to read the topic on an invite', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  expect(src).toContain('On an invite, read the topic with `tail-fleet-posts --thread <id> --since 2h` before you answer; you were not following it.')
+})
+
+// Amendment (agents 16d16c3): the answer is a phrase from the agent's own list.
+
+const phraseFile = (body: unknown) => {
+  const d = mkdtempSync(join(tmpdir(), 'phrases-'))
+  realFs.mkdirSync(join(d, 'Grady'))
+  if (body !== undefined) fsWrite(join(d, 'Grady', 'telegram-phrases.json'), typeof body === 'string' ? body : JSON.stringify(body))
+  return phrasesFile('Grady', d)!
+}
+
+test('phrases: a pick comes from the list for its kind, read on each use', () => {
+  const file = phraseFile({ arrive: ['Grady reporting.', 'Here.'], depart: ['Gone.'] })
+  const p = new PhrasePicker({ file, name: () => 'Grady', stderr: () => {} })
+  for (let i = 0; i < 10; i++) expect(['Grady reporting.', 'Here.']).toContain(p.pick('arrive'))
+  expect(p.pick('depart')).toBe('Gone.')
+  fsWrite(file, JSON.stringify({ arrive: ['Edited.'], depart: ['Gone.'] }))
+  expect(p.pick('arrive')).toBe('Edited.')
+})
+
+test(`phrases: a phrase over ${PHRASE_MAX_WORDS} words, or empty, is never picked`, () => {
+  const long = 'one two three four five six seven eight nine ten eleven twelve thirteen'
+  const twelve = 'one two three four five six seven eight nine ten eleven twelve'
+  const file = phraseFile({ arrive: [long, '', '   ', twelve, 7], depart: [] })
+  let r = 0
+  const p = new PhrasePicker({ file, name: () => 'Grady', random: () => (r = (r + 0.37) % 1), stderr: () => {} })
+  for (let i = 0; i < 12; i++) expect(p.pick('arrive')).toBe(twelve)
+})
+
+test('phrases: never the same phrase twice in a row', () => {
+  const file = phraseFile({ arrive: ['A.', 'B.', 'C.'], depart: ['D.'] })
+  const p = new PhrasePicker({ file, name: () => 'Grady', random: () => 0, stderr: () => {} })
+  const picks = Array.from({ length: 8 }, () => p.pick('arrive'))
+  for (let i = 1; i < picks.length; i++) expect(picks[i]).not.toBe(picks[i - 1])
+})
+
+test('phrases: missing, unreadable or empty list falls back to "<Name> here." / "<Name> out." with one stderr line', () => {
+  for (const body of [undefined, '{not json', { arrive: [], depart: ['   '] }]) {
+    const errs: string[] = []
+    const p = new PhrasePicker({ file: phraseFile(body), name: () => 'Grady', stderr: l => { errs.push(l) } })
+    expect(p.pick('arrive')).toBe('Grady here.')
+    expect(errs.length).toBe(1)
+    expect(p.pick('depart')).toBe('Grady out.')
+    expect(errs.length).toBe(2)
+  }
+  expect(phrasesFile('<Agent>')).toBeUndefined()
+  const errs: string[] = []
+  expect(new PhrasePicker({ file: undefined, name: () => '@MK_XBot', stderr: l => { errs.push(l) } }).pick('arrive')).toBe('@MK_XBot here.')
+  expect(errs.length).toBe(1)
+})
+
+test('phrases: the server answers invite with an arrive phrase and excuse with a depart phrase', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  expect(src).toContain("phrase: verb => phrasePicker.pick(verb === 'invite' ? 'arrive' : 'depart'),")
+  expect(src).toContain('file: phrasesFile(ACCESS_AGENT),')
+})
