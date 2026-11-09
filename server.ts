@@ -32,6 +32,7 @@ import { runReply, runEditMessage } from './reply.ts'
 import { makeTee, teeInbound, TEE_DIR } from './post-log.ts'
 import { groupDecision, type GroupPolicy } from './group-gate.ts'
 import { relayTags, RelayLimiter, spawnRunner, type RelayRequest } from './tag-relay.ts'
+import { runEditForumTopic } from './forum-topic.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -582,6 +583,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'name'],
       },
     },
+    {
+      name: 'edit_forum_topic',
+      description: 'Rename a topic in a Telegram forum supergroup. Works only from a bot that is an admin with the can_manage_topics right; otherwise Telegram\'s own error comes back.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'The supergroup chat ID' },
+          message_thread_id: { type: 'number', description: 'The topic to rename (its message_thread_id)' },
+          name: { type: 'string', description: 'New topic name (1-128 characters)' },
+        },
+        required: ['chat_id', 'message_thread_id', 'name'],
+      },
+    },
   ],
 }))
 
@@ -635,6 +649,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }],
         }
       }
+      case 'edit_forum_topic':
+        return await runEditForumTopic({ api: bot.api, assertAllowedChat }, args)
       default:
         return {
           content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }],

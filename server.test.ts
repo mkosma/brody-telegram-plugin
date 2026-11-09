@@ -419,3 +419,35 @@ test('relay: the inbound path never relays', () => {
   expect(body).toContain('teeInbound(')
   expect(body).not.toMatch(/\brelay\w*\s*\(|relayLimiter/)
 })
+
+// --- Spec item 4: topic rename ---------------------------------------------
+// Acceptance 7, the stubbed-API form. No live call has been made.
+
+import { runEditForumTopic } from './forum-topic.ts'
+
+test('edit_forum_topic: calls editForumTopic with the topic and name', async () => {
+  const calls: unknown[][] = []
+  const api = { async editForumTopic(...a: unknown[]) { calls.push(a); return true as const } }
+  const res = await runEditForumTopic({ api, assertAllowedChat: () => {} }, { chat_id: GROUP, message_thread_id: 39, name: 'Music' })
+  expect(calls).toEqual([[GROUP, 39, { name: 'Music' }]])
+  expect(res.isError).toBeUndefined()
+  expect(res.content[0].text).toBe('renamed topic 39 to "Music"')
+})
+
+test("edit_forum_topic: on error returns the API's own description", async () => {
+  const api = { async editForumTopic(): Promise<true> {
+    throw Object.assign(new Error("Call to 'editForumTopic' failed!"), { description: 'Bad Request: not enough rights to manage topics' })
+  } }
+  const res = await runEditForumTopic({ api, assertAllowedChat: () => {} }, { chat_id: GROUP, message_thread_id: 39, name: 'Music' })
+  expect(res.isError).toBe(true)
+  expect(res.content[0].text).toBe('edit_forum_topic failed: Bad Request: not enough rights to manage topics')
+})
+
+test('edit_forum_topic: gated by assertAllowedChat before any API call', async () => {
+  let called = false
+  const api = { async editForumTopic(): Promise<true> { called = true; return true } }
+  const deny = () => { throw new Error('chat -1 is not allowlisted') }
+  await expect(runEditForumTopic({ api, assertAllowedChat: deny }, { chat_id: '-1', message_thread_id: 39, name: 'x' }))
+    .rejects.toThrow('not allowlisted')
+  expect(called).toBe(false)
+})
