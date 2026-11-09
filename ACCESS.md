@@ -64,13 +64,17 @@ edit-telegram-access Vera group-remove -1001654782309
 
 `mention` only changes a group that is already enabled; it never adds one. Re-running `group-add` on an enabled group resets `requireMention` and keeps the group's member list.
 
-**Per thread.** A forum topic (or any thread) can override the group's `requireMention`. The thread setting wins for that thread only; the General topic carries no thread id and always uses the group setting. A tag, a reply to the bot, or a `mentionPatterns` match still counts as a mention.
+**Per thread.** A forum topic (or any thread) can override the group's `requireMention`. The thread setting wins for that thread only. The General topic carries no thread id, so its entry is keyed `"general"`; with no such entry it uses the group setting. A tag, a reply to the bot, or a `mentionPatterns` match still counts as a mention.
 
 ```
 edit-telegram-access Vera thread -1001654782309 39 --require-mention
 edit-telegram-access Vera thread -1001654782309 39 --no-require-mention
 edit-telegram-access Vera thread -1001654782309 39 --clear
 ```
+
+**From the topic itself: `/invite` and `/excuse`.** In a group, a sender in the top-level `allowFrom` can type `/invite @vera` (or `/invite@MK_VeraBot`, or several names: `/invite @vera @grady`) to set that thread's `requireMention` to `false` for each bot named, and `/excuse @vera` to set it back to `true`. Each bridge acts only on its own agent's name or its own bot username; a command with no name, or from anyone else, does nothing and gets no answer, and is never delivered as chat. An `/invite` into a group the bot has no entry for creates the entry mention-only with only that thread open. `/excuse` never creates a group. Re-running either in the state it already sets writes nothing.
+
+The bridge answers in the thread itself, with one random line from the agent's `~/dev/agents/agents/<Agent>/telegram-phrases.json` (`{"arrive": [...], "depart": [...]}`, read on each use; a phrase that is empty or over 12 words is skipped, and a bot never repeats its last line). Without a usable list it answers `<Name> here.` or `<Name> out.` and logs one stderr line. The session is told with a channel event carrying `command` and `thread_key`. Under `TELEGRAM_ACCESS_MODE=static` the bot answers that it can't change its settings and changes nothing.
 
 To restrict which members can trigger the bot in a group, set that group's `"allowFrom"` list by hand in `access.json`. There is no command for it yet.
 
@@ -81,6 +85,7 @@ To restrict which members can trigger the bot in a group, set that group's `"all
 In groups with `requireMention: true`, any of the following triggers the bot:
 
 - A structured `@botusername` mention
+- `@<name>` for the bridge's own agent (`@vera`, `hi @Vera,`), case-insensitive, when the `claude()` wrapper verified that name. `@verabot`, `x@vera.com` and `@veranda` do not count.
 - A reply to one of the bot's messages
 - A match against any regex in `mentionPatterns`
 
