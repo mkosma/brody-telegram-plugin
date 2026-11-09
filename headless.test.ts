@@ -251,3 +251,19 @@ test('headless bridge: a 409 is logged once, never retried, and exits 0 after th
   expect(err).toContain('409 Conflict - another poller holds this token')
   expect(err).not.toContain(FAKE_TOKEN)
 }, 20000)
+
+// grammy retries an unreachable API inside bot.start and prints nothing, so
+// this proves only what is so: the bridge stays up and no token reaches stderr.
+test('headless bridge: a Bot API it cannot reach does not end it, and the token is never printed', async () => {
+  const api = fakeApi()
+  const dead = api.root
+  api.server.stop(true)
+  const b = spawnBridge({ ...api, root: dead }, { TELEGRAM_HEADLESS: '1' })
+  await Bun.sleep(2500)
+  expect(b.proc.exitCode).toBe(null)
+  b.proc.kill('SIGTERM')
+  expect(await exitedWithin(b.proc, 4000)).toBe(true)
+  const err = await b.stderr()
+  expect(err).not.toContain(FAKE_TOKEN)
+  expect(err).not.toContain('FAKE-TOKEN')
+}, 20000)
