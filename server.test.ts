@@ -621,7 +621,7 @@ test('invite: /invite @vera leaves Grady\'s access unchanged, and a nameless /in
   expect(await g.send('/invite @vera')).toBe('ignore')
   expect(await g.send('/invite@MK_VeraBot')).toBe('ignore')
   expect(await g.send('/invite')).toBe('ignore')
-  expect(await g.send('/invite grady')).toBe('ignore')
+  expect(await g.send('/invite x@grady.com')).toBe('ignore')
   expect(g.saves.length + g.answers.length + g.events.length).toBe(0)
   expect(g.access()).toEqual({ allowFrom: [String(MONTY)], groups: {} })
   // Not a command at all: the ordinary gate decides.
@@ -692,9 +692,28 @@ test('invite: parse and apply are case-blind about names and keep other thread s
   expect(parseGroupCommand('/Invite @Grady @VERA')).toEqual({ verb: 'invite', names: ['grady', 'vera'] })
   expect(parseGroupCommand('/excuse@MK_GradyBot')).toEqual({ verb: 'excuse', names: ['mk_gradybot'] })
   expect(parseGroupCommand('/invite x@grady.com')).toEqual({ verb: 'invite', names: [] })
+  // The @ is optional; a token is a name only when the whole of it is one.
+  expect(parseGroupCommand('/excuse Grady')).toEqual({ verb: 'excuse', names: ['grady'] })
+  expect(parseGroupCommand('/excuse grady, maya')).toEqual({ verb: 'excuse', names: ['grady', 'maya'] })
+  expect(parseGroupCommand('/invite @grady and Vera.')).toEqual({ verb: 'invite', names: ['grady', 'and', 'vera'] })
+  expect(parseGroupCommand('/excuse x@grady.com')).toEqual({ verb: 'excuse', names: [] })
   const a: CommandAccess = { allowFrom: [], groups: { [GROUP]: { requireMention: false, allowFrom: ['9'], threads: { '39': { requireMention: true } } } } }
   expect(applyGroupCommand(a, GROUP, '40', 'invite')).toBe(true)
   expect(a.groups[GROUP]).toEqual({ requireMention: false, allowFrom: ['9'], threads: { '39': { requireMention: true }, '40': { requireMention: false } } })
+})
+
+test('excuse: a name written without the @ moves the bridge it names and no other', async () => {
+  const open = { allowFrom: [String(MONTY)], groups: { [GROUP]: { requireMention: true, allowFrom: [], threads: { '40': { requireMention: false } } } } }
+  const msg: CommandMessage = { chat_id: GROUP, chat_type: 'supergroup', from: { id: MONTY }, text: '/excuse Grady', message_thread_id: THREAD }
+  const grady = commandRig({ access: open })
+  expect(planGroupCommand(grady.deps, msg)).toEqual({ kind: 'act', verb: 'excuse', chat_id: GROUP, thread_id: THREAD, key: '40' })
+  expect(await grady.send('/excuse Grady')).toBe('changed')
+  expect(grady.access().groups[GROUP].threads?.['40']).toEqual({ requireMention: true })
+  expect(grady.answers).toEqual([{ chat_id: GROUP, text: 'DEPART', thread_id: 40 }])
+  const vera = commandRig({ agent: 'Vera', bot: 'MK_VeraBot', access: open })
+  expect(planGroupCommand(vera.deps, msg)).toEqual({ kind: 'ignore' })
+  expect(await vera.send('/excuse Grady')).toBe('ignore')
+  expect(vera.saves.length + vera.answers.length + vera.events.length).toBe(0)
 })
 
 test('invite: an unverified agent name acts only on its bot username', async () => {

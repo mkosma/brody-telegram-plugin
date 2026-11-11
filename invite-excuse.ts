@@ -7,8 +7,11 @@
  * BEFORE THE GATE. Privacy mode is off for every fleet bot, so each bridge
  * receives the command however the group is gated, and each acts only when
  * the command names its own agent (`@grady`) or its own bot
- * (`@MK_GradyBot`, or Telegram's `/invite@MK_GradyBot`). A command with no
- * name means nothing, because which bot was meant is ambiguous.
+ * (`@MK_GradyBot`, or Telegram's `/invite@MK_GradyBot`). The @ is optional:
+ * `/excuse Grady` names Grady as `/excuse @grady` does. Every bare word after
+ * the verb is read as a name, and a word that is no bridge's name moves
+ * nobody. A command with no name means nothing, because which bot was meant
+ * is ambiguous.
  *
  * AUTHORITY. Only a sender in this bridge's top-level `allowFrom` (today,
  * Monty) may run it; for anyone else, and for any bot, nothing happens and
@@ -28,11 +31,21 @@ export type Verb = 'invite' | 'excuse'
 
 export const STATIC_ANSWER = "I can't change my settings in this mode."
 
-/** `/invite @a @b`, `/excuse@MK_ABot`: the verb and the names it carries, lowercased, without the @. */
+/**
+ * `/invite @a b`, `/excuse@MK_ABot`: the verb and the names it carries,
+ * lowercased, without the @. The @ is optional. The text after the verb is
+ * split on whitespace and commas, and a token is a name only when the whole
+ * of it, less trailing punctuation, is `@?[A-Za-z0-9_]+`: `x@grady.com`
+ * names nobody.
+ */
 export function parseGroupCommand(text: string): { verb: Verb; names: string[] } | undefined {
   const m = /^\/(invite|excuse)(?:@([A-Za-z0-9_]+))?(?=\s|$)([\s\S]*)$/i.exec(text.trim())
   if (!m) return undefined
-  const names = [...m[3].matchAll(/(?:^|[^\w@])@([A-Za-z0-9_]+)/g)].map(x => x[1].toLowerCase())
+  const names = m[3]
+    .split(/[\s,]+/)
+    .map(t => t.replace(/[.,!?;:]+$/, ''))
+    .filter(t => /^@?[A-Za-z0-9_]+$/.test(t))
+    .map(t => t.replace(/^@/, '').toLowerCase())
   if (m[2]) names.unshift(m[2].toLowerCase())
   return { verb: m[1].toLowerCase() as Verb, names }
 }
