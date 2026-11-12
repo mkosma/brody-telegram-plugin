@@ -6,7 +6,8 @@ each feature's core line and show that its test goes red. Extended for
 SPEC-bridge-names-invite-excuse-2026-11-09 (ids N*, L*, I*), whose every
 acceptance case carries a revert that goes red. Extended again for
 SPEC-on-call-agents-wake-and-sleep-2026-11-09, "The wake check" (ids W*).
-Extended for SPEC-bridge-who-and-all-2026-11-12 (ids A*).
+Extended for SPEC-bridge-who-and-all-2026-11-12 (ids A*). Extended for
+SPEC-bridge-polls-only-after-initialized-2026-11-12 (ids PG*).
 
 Each revert is applied to a COPY of this tree in a temp dir (node_modules is
 symlinked in), never to the tree itself. A revert whose text is not found
@@ -369,6 +370,14 @@ REVERTS = [
      "    if (command.kind === 'who') void runWho({ run: spawnOutput, answer: deps.answer }, command)\n",
      "",
      "all: the server runs who-hears through spawnOutput without awaiting it, and posts a say plan"),
+    ("PG1", "poll gate", "server.ts",
+     "  if (!(await clientInitialized)) {",
+     "  if (false) {",
+     "poll gate: polling does not start before initialized, and starts after it"),
+    ("PG2", "poll gate", "server.ts",
+     "  setTimeout(() => resolve(false), INIT_WAIT_MS).unref()\n",
+     "",
+     "poll gate: with no initialized, polling starts at the bound and says so on stderr"),
 ]
 
 FAIL_RE = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)

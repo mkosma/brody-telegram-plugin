@@ -111,7 +111,8 @@ process.on('uncaughtException', err => {
 // Strict: no bare yes/no (conversational), no prefix/suffix chatter.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
-const bot = new Bot(TOKEN)
+// TELEGRAM_API_ROOT is for tests only: it points the bot at a stub API.
+const bot = new Bot(TOKEN, process.env.TELEGRAM_API_ROOT ? { client: { apiRoot: process.env.TELEGRAM_API_ROOT } } : {})
 let botUsername = ''
 
 // The post log (spec item 1): every group post this bot sends or receives, one
@@ -656,6 +657,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       isError: true,
     }
   }
+})
+
+// POLL ONLY AFTER THE CLIENT HAS INITIALIZED. connect() resolves when the stdio
+// transport starts, not when the client sends notifications/initialized, and
+// the MCP lifecycle says a server sends nothing but pings and logging before
+// then. On an on-call wake the update that caused the wake is already pending,
+// so polling straight after connect() hands it to the client inside its
+// handshake window: both wakes of Grady on 2026-11-12 delivered no turn.
+//
+// The wait is bounded, because a bridge that never polls is the worse failure:
+// deaf, with nothing reporting it. 30s is the client's own MCP connect timeout.
+// TELEGRAM_INIT_WAIT_MS shortens it for tests only.
+const INIT_WAIT_MS = Number(process.env.TELEGRAM_INIT_WAIT_MS) || 30_000
+// Resolves true on initialized, false when the bound runs out first.
+const clientInitialized = new Promise<boolean>(resolve => {
+  mcp.oninitialized = () => resolve(true)
+  setTimeout(() => resolve(false), INIT_WAIT_MS).unref()
 })
 
 await mcp.connect(new StdioServerTransport())
@@ -1335,6 +1353,12 @@ bot.api.config.use(async (prev, method, payload, signal) => {
 // (MCP stdin keeps it running). Outbound tools kept working but the bot was
 // deaf to inbound messages until a full restart.
 void (async () => {
+  if (!(await clientInitialized)) {
+    process.stderr.write(
+      `telegram channel: client sent no initialized within ${INIT_WAIT_MS}ms, polling anyway\n`,
+    )
+  }
+  if (shuttingDown) return
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
