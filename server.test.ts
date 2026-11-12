@@ -874,3 +874,206 @@ test('omf: the server handler opens through openTapped, with the tapped message\
   expect(body).toContain("thread_id: tapped && 'message_thread_id' in tapped ? tapped.message_thread_id : undefined")
   expect(body).not.toMatch(/(?<!\.)\bexec\(/)
 })
+
+// --- SPEC-bridge-who-and-all-2026-11-12 -------------------------------------
+// /who answered by one bridge, and "all" / "all but <names>" for /invite and
+// /excuse. Each test below has a revert in revert-proofs.py (ids A*).
+
+import { planGroupCommand as planCmd, runGroupCommand as runCmd, sayGroupCommand, runWho, spawnOutput, allSummary, whoFailure, WHO_ANSWERER, WHO_HEARS_BIN, WHO_TIMEOUT_MS, MIXED_ANSWER, type OutputRunner } from './invite-excuse.ts'
+
+const FLEET = ['Vera', 'Grady', 'Werner', 'Taiichi', 'Brody', 'Maya']
+const openIn40 = (): CommandAccess => ({
+  allowFrom: [String(MONTY)],
+  groups: { [GROUP]: { requireMention: true, allowFrom: [], threads: { '40': { requireMention: false } } } },
+})
+
+/** Six bridges, each given the same command, composed as server.ts composes it. */
+function fleetRig(access: () => CommandAccess = openIn40, whoRun?: OutputRunner) {
+  const bridges = FLEET.map(agent => {
+    const rig = commandRig({ agent, bot: `MK_${agent}Bot`, access: access() })
+    const whoCalls: Array<{ argv: string[]; timeoutMs: number }> = []
+    const run: OutputRunner = whoRun ?? (async (argv, timeoutMs) => {
+      whoCalls.push({ argv, timeoutMs })
+      return { rc: 0, stdout: 'Vera: hears everything; last post reached its session 1m ago\n', stderr: '' }
+    })
+    return { agent, rig, whoCalls, run }
+  })
+  const send = async (text: string, thread: number | null = THREAD, from: CommandMessage['from'] = { id: MONTY }) => {
+    const kinds: Record<string, string> = {}
+    for (const b of bridges) {
+      const plan = planCmd(b.rig.deps, { chat_id: GROUP, chat_type: 'supergroup', from, text, ...(thread != null ? { message_thread_id: thread } : {}) })
+      kinds[b.agent] = plan.kind
+      if (plan.kind === 'say') await sayGroupCommand(b.rig.deps, plan)
+      if (plan.kind === 'who') await runWho({ run: b.run, answer: b.rig.deps.answer, stderr: () => {} }, plan)
+      if (plan.kind === 'act') await runCmd(b.rig.deps, plan)
+    }
+    return kinds
+  }
+  const of = (agent: string) => bridges.find(b => b.agent === agent)!
+  const answers = () => bridges.flatMap(b => b.rig.answers.map(a => ({ agent: b.agent, ...a })))
+  const excused = () => bridges.filter(b => b.rig.access().groups[GROUP]?.threads?.['40']?.requireMention === true).map(b => b.agent)
+  return { bridges, send, of, answers, excused }
+}
+
+test('who: /who from Monty makes the answerer spawn who-hears once with the thread key, and no other bridge does anything', async () => {
+  expect(WHO_ANSWERER).toBe('Vera')
+  expect(WHO_TIMEOUT_MS).toBe(15000)
+  expect(WHO_HEARS_BIN.endsWith('/dev/agents/agents/Vera/bin/who-hears')).toBe(true)
+  for (const text of ['/who', '/who@MK_GradyBot', '/WHO']) {
+    const f = fleetRig()
+    const kinds = await f.send(text)
+    expect(kinds).toEqual({ Vera: 'who', Grady: 'ignore', Werner: 'ignore', Taiichi: 'ignore', Brody: 'ignore', Maya: 'ignore' })
+    expect(f.bridges.flatMap(b => b.whoCalls)).toEqual([{ argv: [WHO_HEARS_BIN, '40', '--chat', GROUP], timeoutMs: WHO_TIMEOUT_MS }])
+    // One reply, in the command's own thread, with who-hears's output.
+    expect(f.answers()).toEqual([{ agent: 'Vera', chat_id: GROUP, text: 'Vera: hears everything; last post reached its session 1m ago', thread_id: THREAD }])
+    // /who changes nobody's access and is no event for any session.
+    expect(f.bridges.flatMap(b => b.rig.saves)).toEqual([])
+    expect(f.bridges.flatMap(b => b.rig.events)).toEqual([])
+  }
+  // In General the key is "general" and the reply carries no thread.
+  const g = fleetRig()
+  await g.send('/who', null)
+  expect(g.of('Vera').whoCalls[0].argv).toEqual([WHO_HEARS_BIN, 'general', '--chat', GROUP])
+  expect(g.answers()).toEqual([{ agent: 'Vera', chat_id: GROUP, text: 'Vera: hears everything; last post reached its session 1m ago' }])
+  // Not a command mid-sentence, and not in a DM.
+  expect((await g.send('tell me /who'))['Vera']).toBe('none')
+  expect(planCmd(g.of('Vera').rig.deps, { chat_id: DM, chat_type: 'private', from: { id: MONTY }, text: '/who' }).kind).toBe('none')
+})
+
+test('who: /who from anyone but Monty spawns nothing and gets no reply', async () => {
+  const f = fleetRig()
+  for (const from of [{ id: 222 }, { id: MONTY, is_bot: true }]) {
+    const kinds = await f.send('/who', THREAD, from)
+    expect(new Set(Object.values(kinds))).toEqual(new Set(['ignore']))
+  }
+  expect(f.bridges.flatMap(b => b.whoCalls)).toEqual([])
+  expect(f.answers()).toEqual([])
+})
+
+function whoStub(body: string): string {
+  const p = join(mkdtempSync(join(tmpdir(), 'who-stub-')), 'who-hears')
+  fsWrite(p, `#!/bin/sh\n${body}\n`)
+  fsChmod(p, 0o755)
+  return p
+}
+
+async function whoWith(bin: string, timeoutMs?: number) {
+  const answers: Array<{ chat_id: string; text: string; thread_id?: number }> = []
+  const result = await runWho({
+    run: spawnOutput,
+    bin,
+    ...(timeoutMs != null ? { timeoutMs } : {}),
+    answer: async (chat_id, text, thread_id) => { answers.push({ chat_id, text, ...(thread_id != null ? { thread_id } : {}) }) },
+    stderr: () => {},
+  }, { kind: 'who', chat_id: GROUP, thread_id: THREAD, key: '40' })
+  return { result, answers }
+}
+
+test('who: a who-hears that exits 1 gets one failure line with its first stderr line', async () => {
+  const ok = await whoWith(whoStub('echo "key=$1 flag=$2 chat=$3"'))
+  expect(ok).toEqual({ result: 'answered', answers: [{ chat_id: GROUP, text: `key=40 flag=--chat chat=${GROUP}`, thread_id: THREAD }] })
+  const bad = await whoWith(whoStub('echo "partial line"; echo "" >&2; echo "ssh: mini unreachable" >&2; echo "second line" >&2; exit 1'))
+  expect(bad).toEqual({ result: 'failed', answers: [{ chat_id: GROUP, text: '/who failed: ssh: mini unreachable', thread_id: THREAD }] })
+  // Silent failures still say something, and a missing script is a failure, not a throw.
+  expect((await whoWith(whoStub('exit 3'))).answers.map(a => a.text)).toEqual(['/who failed: exited 3'])
+  expect((await whoWith(whoStub('exit 0'))).answers.map(a => a.text)).toEqual(['/who failed: no output'])
+  const missing = await whoWith(join(tmpdir(), 'no-such-who-hears-bin'))
+  expect(missing.result).toBe('failed')
+  expect(missing.answers).toHaveLength(1)
+  expect(missing.answers[0].text.startsWith('/who failed: ')).toBe(true)
+  expect(whoFailure(124, 'ignored')).toBe('/who failed: timed out')
+})
+
+test('who: a who-hears that sleeps past the bound is killed and gets one timed-out line', async () => {
+  const started = Date.now()
+  const hung = await whoWith(whoStub('exec sleep 20'), 300)
+  expect(hung).toEqual({ result: 'failed', answers: [{ chat_id: GROUP, text: '/who failed: timed out', thread_id: THREAD }] })
+  expect(Date.now() - started).toBeLessThan(3000)
+})
+
+test('all: /excuse all is applied by every bridge and only the answerer posts', async () => {
+  const f = fleetRig()
+  const kinds = await f.send('/excuse all')
+  expect(new Set(Object.values(kinds))).toEqual(new Set(['act']))
+  expect(f.excused()).toEqual(FLEET)
+  expect(f.bridges.map(b => b.rig.saves.length)).toEqual([1, 1, 1, 1, 1, 1])
+  // One confirmation, not six: no bridge says its own phrase.
+  expect(f.answers()).toEqual([{ agent: 'Vera', chat_id: GROUP, text: 'Excused: all.', thread_id: THREAD }])
+  // Each session is still told of its own change.
+  expect(f.bridges.map(b => b.rig.events)).toEqual(FLEET.map(() => [{ verb: 'excuse', key: '40' }]))
+
+  // /invite all, into a group no bridge has an entry for.
+  const i = fleetRig(() => ({ allowFrom: [String(MONTY)], groups: {} }))
+  await i.send('/invite ALL')
+  for (const b of i.bridges) expect(b.rig.access().groups[GROUP].threads).toEqual({ '40': { requireMention: false } })
+  expect(i.answers()).toEqual([{ agent: 'Vera', chat_id: GROUP, text: 'Invited: all.', thread_id: THREAD }])
+  // From anyone else: nothing, anywhere.
+  const n = fleetRig()
+  expect(new Set(Object.values(await n.send('/excuse all', THREAD, { id: 222 })))).toEqual(new Set(['ignore']))
+  expect(n.excused()).toEqual([])
+  expect(n.answers()).toEqual([])
+})
+
+test('all: /excuse all but maya leaves Maya alone under every spelling of her name, and the others apply', async () => {
+  for (const text of ['/excuse all but maya', '/excuse all but Maya', '/excuse all but @maya', '/excuse all but MK_MayaBot', '/excuse All BUT @MK_MayaBot.']) {
+    const f = fleetRig()
+    const kinds = await f.send(text)
+    expect(kinds['Maya']).toBe('ignore')
+    expect(f.excused()).toEqual(['Vera', 'Grady', 'Werner', 'Taiichi', 'Brody'])
+    expect(f.of('Maya').rig.saves).toEqual([])
+    expect(f.of('Maya').rig.events).toEqual([])
+    const but = text.toLowerCase().includes('mk_mayabot') ? 'mk_mayabot' : 'maya'
+    expect(f.answers()).toEqual([{ agent: 'Vera', chat_id: GROUP, text: `Excused: all but ${but}.`, thread_id: THREAD }])
+  }
+  // Several exclusions.
+  const two = fleetRig()
+  await two.send('/excuse all but maya, grady')
+  expect(two.excused()).toEqual(['Vera', 'Werner', 'Taiichi', 'Brody'])
+  expect(two.answers().map(a => a.text)).toEqual(['Excused: all but maya, grady.'])
+  // The answerer excluded: it changes nothing of its own and still posts the summary.
+  const v = fleetRig()
+  expect((await v.send('/excuse all but vera'))['Vera']).toBe('say')
+  expect(v.excused()).toEqual(['Grady', 'Werner', 'Taiichi', 'Brody', 'Maya'])
+  expect(v.of('Vera').rig.saves).toEqual([])
+  expect(v.answers()).toEqual([{ agent: 'Vera', chat_id: GROUP, text: 'Excused: all but vera.', thread_id: THREAD }])
+  expect(allSummary('invite', ['maya'])).toBe('Invited: all but maya.')
+})
+
+test('all: /excuse all vera is refused with one line from the answerer and nothing is applied', async () => {
+  expect(MIXED_ANSWER).toBe('Use "all" or names, not both. Example: /excuse all but maya')
+  for (const text of ['/excuse all vera', '/excuse vera all', '/invite @grady all but maya', '/excuse all but', '/excuse all but all']) {
+    const f = fleetRig()
+    const kinds = await f.send(text)
+    expect(kinds).toEqual({ Vera: 'say', Grady: 'ignore', Werner: 'ignore', Taiichi: 'ignore', Brody: 'ignore', Maya: 'ignore' })
+    expect(f.excused()).toEqual([])
+    expect(f.bridges.flatMap(b => b.rig.saves)).toEqual([])
+    expect(f.bridges.flatMap(b => b.rig.events)).toEqual([])
+    expect(f.answers()).toEqual([{ agent: 'Vera', chat_id: GROUP, text: MIXED_ANSWER, thread_id: THREAD }])
+  }
+  // A list that only names bridges is unchanged: the named bridge acts and answers for itself.
+  const named = fleetRig()
+  await named.send('/excuse vera grady')
+  expect(named.excused()).toEqual(['Vera', 'Grady'])
+  expect(named.answers().map(a => [a.agent, a.text])).toEqual([['Vera', 'DEPART'], ['Grady', 'DEPART']])
+})
+
+test('all: the parse reads who, all, all but, and mixed', () => {
+  expect(parseGroupCommand('/who')).toEqual({ verb: 'who', names: [] })
+  expect(parseGroupCommand('/who@MK_VeraBot')).toEqual({ verb: 'who', names: [] })
+  expect(parseGroupCommand('/whom')).toBeUndefined()
+  expect(parseGroupCommand('/excuse all')).toEqual({ verb: 'excuse', names: ['all'], all: { but: [] } })
+  expect(parseGroupCommand('/invite all but @Maya MK_GradyBot')).toEqual({ verb: 'invite', names: ['all', 'but', 'maya', 'mk_gradybot'], all: { but: ['maya', 'mk_gradybot'] } })
+  expect(parseGroupCommand('/excuse all vera')).toEqual({ verb: 'excuse', names: ['all', 'vera'], mixed: true })
+  expect(parseGroupCommand('/excuse@MK_VeraBot all')).toEqual({ verb: 'excuse', names: ['mk_verabot', 'all'], mixed: true })
+  expect(parseGroupCommand('/excuse vera').all).toBeUndefined()
+})
+
+test('all: the server runs who-hears through spawnOutput without awaiting it, and posts a say plan', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('async function handleInbound(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const early = body.indexOf("if (command.kind !== 'none') {")
+  const block = body.slice(early, body.indexOf('gate(ctx)'))
+  expect(block).toContain("if (command.kind === 'who') void runWho({ run: spawnOutput, answer: deps.answer }, command)")
+  expect(block).toContain("if (command.kind === 'say') await sayGroupCommand(deps, command)")
+})

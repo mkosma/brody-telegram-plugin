@@ -30,7 +30,7 @@ import { join, sep, basename } from 'path'
 import { tapToast, type TapOutcome } from './tap-toast.ts'
 import { runReply, runEditMessage } from './reply.ts'
 import { makeTee, teeInbound, safeTee, outEntry, isGroupChatId, TEE_DIR } from './post-log.ts'
-import { planGroupCommand, runGroupCommand, type CommandDeps, type CommandPlan } from './invite-excuse.ts'
+import { planGroupCommand, runGroupCommand, sayGroupCommand, runWho, spawnOutput, type CommandDeps, type CommandPlan } from './invite-excuse.ts'
 import { PhrasePicker, phrasesFile } from './phrases.ts'
 import { type GroupPolicy } from './group-gate.ts'
 import { inboundDecision, inboundText, safeName, parseEnvFile, ALLOWED_UPDATES } from './inbound-gate.ts'
@@ -1177,8 +1177,8 @@ async function handleInbound(
 
   const teeArgs = { message: ctx.message, chat: ctx.chat, from: ctx.from, text, tee }
 
-  // /invite and /excuse are handled before gate(): a bot hears them however
-  // the topic is gated. A command this bridge does nothing about is dropped,
+  // /invite, /excuse and /who are handled before gate(): a bot hears them
+  // however the topic is gated. A command this bridge does nothing about is dropped,
   // never delivered as chat. A caption is never a command.
   const deps = commandDeps(ctx, text)
   const command: CommandPlan = ctx.chat
@@ -1192,6 +1192,9 @@ async function handleInbound(
     : { kind: 'none' }
   if (command.kind !== 'none') {
     teeInbound(teeArgs, () => ({ action: command.kind === 'act' && !STATIC ? 'deliver' : 'drop' }))
+    if (command.kind === 'say') await sayGroupCommand(deps, command)
+    // Not awaited: who-hears may take its whole bound, and updates are handled in turn.
+    if (command.kind === 'who') void runWho({ run: spawnOutput, answer: deps.answer }, command)
     if (command.kind === 'act') await runGroupCommand(deps, command)
     return
   }

@@ -6,6 +6,7 @@ each feature's core line and show that its test goes red. Extended for
 SPEC-bridge-names-invite-excuse-2026-11-09 (ids N*, L*, I*), whose every
 acceptance case carries a revert that goes red. Extended again for
 SPEC-on-call-agents-wake-and-sleep-2026-11-09, "The wake check" (ids W*).
+Extended for SPEC-bridge-who-and-all-2026-11-12 (ids A*).
 
 Each revert is applied to a COPY of this tree in a temp dir (node_modules is
 symlinked in), never to the tree itself. A revert whose text is not found
@@ -319,6 +320,55 @@ REVERTS = [
      "        allowed_updates: [...ALLOWED_UPDATES],",
      "        allowed_updates: ['message'],",
      "server wiring: polls ALLOWED_UPDATES and takes every handler text from inboundText"),
+    # SPEC-bridge-who-and-all-2026-11-12
+    ("A1", "/who answerer", "invite-excuse.ts",
+     "  if (cmd.verb === 'who') return answerer ? { kind: 'who', ...at } : { kind: 'ignore' }\n",
+     "  if (cmd.verb === 'who') return { kind: 'who', ...at }\n",
+     "who: /who from Monty makes the answerer spawn who-hears once with the thread key, and no other bridge does anything"),
+    ("A2", "/who thread key", "invite-excuse.ts",
+     "[deps.bin ?? WHO_HEARS_BIN, plan.key, '--chat', plan.chat_id]",
+     "[deps.bin ?? WHO_HEARS_BIN, String(plan.thread_id), '--chat', plan.chat_id]",
+     "who: /who from Monty makes the answerer spawn who-hears once with the thread key, and no other bridge does anything"),
+    ("A3", "/who authority", "invite-excuse.ts",
+     "  if (!deps.loadAccess().allowFrom.includes(String(msg.from.id))) return { kind: 'ignore' }\n",
+     "  if (cmd.verb !== 'who' && !deps.loadAccess().allowFrom.includes(String(msg.from.id))) return { kind: 'ignore' }\n",
+     "who: /who from anyone but Monty spawns nothing and gets no reply"),
+    ("A4", "/who failure", "invite-excuse.ts",
+     "  const ok = r.rc === 0 && out.length > 0\n",
+     "  const ok = true\n",
+     "who: a who-hears that exits 1 gets one failure line with its first stderr line"),
+    ("A5", "/who timeout", "invite-excuse.ts",
+     "    const timer = setTimeout(() => { child.kill('SIGKILL'); finish(RC_TIMEOUT) }, timeoutMs)\n    child.stdout?.on(",
+     "    const timer = setTimeout(() => {}, timeoutMs)\n    child.stdout?.on(",
+     "who: a who-hears that sleeps past the bound is killed and gets one timed-out line"),
+    ("A6", "all: one answer", "invite-excuse.ts",
+     "    if (plan.quiet) return\n",
+     "",
+     "all: /excuse all is applied by every bridge and only the answerer posts"),
+    ("A7", "all: one answer", "invite-excuse.ts",
+     "    const summary = answerer ? allSummary(cmd.verb, cmd.all.but) : undefined\n",
+     "    const summary = allSummary(cmd.verb, cmd.all.but)\n",
+     "all: /excuse all is applied by every bridge and only the answerer posts"),
+    ("A8", "all: applies", "invite-excuse.ts",
+     "  if (names.length === 1) return { verb, names, all: { but: [] } }\n",
+     "  if (names.length === 1) return { verb, names }\n",
+     "all: /excuse all is applied by every bridge and only the answerer posts"),
+    ("A9", "all but", "invite-excuse.ts",
+     "    if (cmd.all.but.some(n => mine.has(n))) return summary ? { kind: 'say', chat_id: at.chat_id, thread_id: at.thread_id, text: summary } : { kind: 'ignore' }\n",
+     "",
+     "all: /excuse all but maya leaves Maya alone under every spelling of her name, and the others apply"),
+    ("A10", "all mixed", "invite-excuse.ts",
+     "  return { verb, names, mixed: true }\n",
+     "  return { verb, names, all: { but: [] } }\n",
+     "all: /excuse all vera is refused with one line from the answerer and nothing is applied"),
+    ("A11", "all mixed", "invite-excuse.ts",
+     "  if (cmd.mixed) return answerer ? { kind: 'say', chat_id: at.chat_id, thread_id: at.thread_id, text: MIXED_ANSWER } : { kind: 'ignore' }\n",
+     "  if (cmd.mixed) return { kind: 'say', chat_id: at.chat_id, thread_id: at.thread_id, text: MIXED_ANSWER }\n",
+     "all: /excuse all vera is refused with one line from the answerer and nothing is applied"),
+    ("A12", "/who wiring", "server.ts",
+     "    if (command.kind === 'who') void runWho({ run: spawnOutput, answer: deps.answer }, command)\n",
+     "",
+     "all: the server runs who-hears through spawnOutput without awaiting it, and posts a say plan"),
 ]
 
 FAIL_RE = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)
