@@ -10,7 +10,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 
 import { tmpdir } from 'os'
 import { join } from 'path'
 import type { Update } from 'grammy/types'
-import { classifyUpdate, bridgeRunning, ACK_TEXT, EXIT, type ClassifyEnv, type PsRunner } from './wake-check.ts'
+import { classifyUpdate, excusedBy, bridgeRunning, ACK_TEXT, EXIT, type ClassifyEnv, type PsRunner } from './wake-check.ts'
 import { ALLOWED_UPDATES, inboundText, parseEnvFile, type GateAccess } from './inbound-gate.ts'
 
 // The end-to-end tests spawn bun subprocesses, several in series; under the
@@ -245,6 +245,102 @@ test('wake check: the ack is posted once per wake (dedupe on update id)', async 
   expect(JSON.parse(readFileSync(f.ackFile, 'utf8')).update_id).toBe(second.update_id)
 })
 
+// --- the ack yields to a later /excuse, and a group command posts none -----------------
+// SPEC-wake-ack-yields-to-a-later-excuse-2026-11-14. Thread 40 is open to Testy.
+
+test('wake ack: a message then "/excuse all but vera" wakes with no post and no ack record', async () => {
+  const f = fixture()
+  const msg = grp('anyone around?', 40)
+  const excuse = grp('/excuse all but vera', 40)
+  const stub = startStub([msg, excuse])
+  const r = await runWake(f.home, stub.url)
+  expect(r.rc).toBe(EXIT.DELIVER)
+  expect(r.out).toContain(`deliverable update ${msg.update_id} (group), ack skipped (excused by update ${excuse.update_id})`)
+  expect(sends(stub).length).toBe(0)
+  expect(existsSync(f.ackFile)).toBe(false)
+  // Both stay pending for the woken bridge, and the peek applied nothing.
+  expect(stub.pending.map(u => u.update_id)).toEqual([msg.update_id, excuse.update_id])
+  expect(JSON.parse(readFileSync(join(f.stateDir, 'access.json'), 'utf8'))).toEqual(ACCESS)
+})
+
+test('wake ack: a message then "/excuse all but testy" is acknowledged (this agent was not excused)', async () => {
+  const f = fixture()
+  const msg = grp('anyone around?', 40)
+  const stub = startStub([msg, grp('/excuse all but testy', 40)])
+  const r = await runWake(f.home, stub.url)
+  expect(r.rc).toBe(EXIT.DELIVER)
+  expect(r.out).toContain('ack sent')
+  expect(sends(stub).map(c => [c.body.chat_id, c.body.message_thread_id, c.body.text])).toEqual([[String(GROUP_ID), 40, ACK_TEXT]])
+  expect(JSON.parse(readFileSync(f.ackFile, 'utf8')).update_id).toBe(msg.update_id)
+})
+
+test('wake ack: a message then an /excuse in a different thread is acknowledged', async () => {
+  const f = fixture()
+  const stub = startStub([grp('anyone around?', 40), grp('/excuse all', 41)])
+  expect((await runWake(f.home, stub.url)).rc).toBe(EXIT.DELIVER)
+  expect(sends(stub).map(c => c.body.message_thread_id)).toEqual([40])
+})
+
+test('wake ack: an /excuse alone, and an /invite alone, wake with no post', async () => {
+  for (const text of ['/excuse @testy', '/excuse all', '/invite @testy', '/invite all but vera']) {
+    const f = fixture()
+    const cmd = grp(text, 40)
+    const stub = startStub([cmd])
+    const r = await runWake(f.home, stub.url)
+    expect(r.rc).toBe(EXIT.DELIVER)
+    expect(r.out).toContain(`deliverable update ${cmd.update_id} (${text.slice(1, 7)}), ack skipped (group command)`)
+    expect(sends(stub).length).toBe(0)
+    expect(existsSync(f.ackFile)).toBe(false)
+    expect(stub.pending.map(u => u.update_id)).toEqual([cmd.update_id])
+  }
+})
+
+test('wake ack: a static bridge applies no /excuse, so the message is acknowledged', async () => {
+  const f = fixture(ACCESS, `TELEGRAM_BOT_TOKEN=${TOKEN}\nTELEGRAM_ACCESS_MODE=static\n`)
+  const stub = startStub([grp('anyone around?', 40), grp('/excuse all', 40)])
+  expect((await runWake(f.home, stub.url)).rc).toBe(EXIT.DELIVER)
+  expect(sends(stub).length).toBe(1)
+})
+
+test('wake ack: only an /excuse this bridge would act on, in the same chat and thread, withdraws a message', () => {
+  const msg = grp('anyone around?', 40)
+  const by = (later: Update[], u: Update = msg) => excusedBy(u, later, env())
+  const ex = grp('/excuse @testy', 40)
+  expect(by([ex])).toBe(ex.update_id)
+  expect(by([grp('/excuse Testy', 40)])).toBeDefined()
+  expect(by([grp('/excuse all but vera', 40)])).toBeDefined()
+  // Found behind other traffic, and the first one that withdraws it is named.
+  const second = grp('/excuse all', 40)
+  expect(by([grp('lunch?', 40), grp('/excuse @vera', 40), second, grp('/excuse @testy', 40)])).toBe(second.update_id)
+  // Not this bot, not an allowFrom sender, another thread, the General topic.
+  expect(by([grp('/excuse @vera', 40)])).toBeUndefined()
+  expect(by([grp('/excuse all but testy', 40)])).toBeUndefined()
+  expect(by([grp('/excuse @testy', 40, STRANGER)])).toBeUndefined()
+  expect(by([grp('/excuse @testy', 41)])).toBeUndefined()
+  expect(by([grp('/excuse @testy')])).toBeUndefined()
+  // Another chat, same thread id.
+  const elsewhere = grp('/excuse @testy', 40) as any
+  elsewhere.message.chat = { id: -100555, type: 'supergroup', title: 'Other' }
+  expect(by([elsewhere as Update])).toBeUndefined()
+  // An /invite is not an /excuse.
+  expect(by([grp('/invite @testy', 40)])).toBeUndefined()
+  // A message that tags the agent is delivered after the /excuse too, so it is still acknowledged.
+  expect(by([grp('/excuse @testy', 40)], grp('@testy are you there', 40))).toBeUndefined()
+  // Nothing queued behind it.
+  expect(by([])).toBeUndefined()
+  // access itself is never changed by the lookahead.
+  expect(ACCESS.groups[String(GROUP_ID)].threads).toEqual({ '40': { requireMention: false } })
+})
+
+test('wake ack: a reaction does not yield to a later /excuse, and static mode yields to none', () => {
+  const react = {
+    update_id: nextId++,
+    message_reaction: { chat: { id: GROUP_ID, type: 'supergroup' }, message_id: 5, user: MONTY, date: 0, old_reaction: [], new_reaction: [{ type: 'emoji', emoji: '👍' }] },
+  } as unknown as Update
+  expect(excusedBy(react, [grp('/excuse @testy', 40), grp('/excuse @testy')], env())).toBeUndefined()
+  expect(excusedBy(grp('anyone around?', 40), [grp('/excuse @testy', 40)], env(ACCESS, true))).toBeUndefined()
+})
+
 // --- refuse while the bridge is up -----------------------------------------------------
 
 async function fakeBridge(home: string, stateDir: string) {
@@ -325,8 +421,8 @@ test('wake classify: an /invite or /excuse naming this agent delivers even where
     return u as Update
   }
   const inv = classifyUpdate(unknownGroup(`/invite@${BOT}`), env())
-  expect(inv).toMatchObject({ action: 'deliver', why: 'invite', ack: { chat_id: '-100555', thread_id: 77 } })
-  expect(classifyUpdate(grp('/excuse @testy', 40), env())).toMatchObject({ action: 'deliver', why: 'excuse' })
+  expect(inv).toEqual({ action: 'deliver', why: 'invite', noAck: 'group command' })
+  expect(classifyUpdate(grp('/excuse @testy', 40), env())).toEqual({ action: 'deliver', why: 'excuse', noAck: 'group command' })
   // Naming another agent: the bridge ignores it and logs it delivered:false.
   const other = classifyUpdate(grp('/invite @vera', 39), env())
   expect(other).toMatchObject({ action: 'drop', why: 'command-not-mine' })
