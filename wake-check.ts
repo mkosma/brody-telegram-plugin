@@ -11,6 +11,8 @@
  *            It is left unconfirmed, so the woken bridge receives it in full,
  *            and "One moment, I'm on my way." is posted once in its chat and
  *            thread (deduped on update id in ~/.agents/<Agent>/tmp/wake-ack.json).
+ *            The wake happens without the post for a group command, and for a
+ *            message a later /excuse withdrew (THE ACK, below).
  *   exit 0   nothing deliverable is pending.
  *   exit 3   the peek failed (or could not finish in time): do not wake.
  *   exit 4   refused: a server.ts for this agent's state directory is running.
@@ -23,6 +25,14 @@
  * drop is written to the post log with delivered:false, the line the bridge
  * writes, and confirmed, which is what the bridge does with it anyway: that is
  * what keeps a mention from being buried behind Telegram's 100-update page.
+ *
+ * THE ACK says the agent is coming, so it is posted only where that is the
+ * answer (SPEC-wake-ack-yields-to-a-later-excuse-2026-11-14). An /invite or
+ * /excuse still wakes the agent, because the bridge must launch to apply it,
+ * but the bridge answers it: being excused is not answered with "on my way".
+ * And a message yields to an /excuse queued behind it for the same chat and
+ * thread, when the bridge would no longer deliver the message once that
+ * /excuse is applied: the call was withdrawn before anyone came.
  *
  * THE TOKEN is read from the agent's own channel env file, parsed as server.ts
  * parses it, inside this process. It is never printed. Unlike server.ts, a
@@ -43,7 +53,8 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFil
 import { homedir } from 'os'
 import { basename, join } from 'path'
 import { ALLOWED_UPDATES, inboundDecision, inboundText, parseEnvFile, type GateAccess } from './inbound-gate.ts'
-import { planGroupCommand, type CommandDeps } from './invite-excuse.ts'
+import { threadKey } from './group-gate.ts'
+import { applyGroupCommand, planGroupCommand, type CommandDeps, type CommandPlan } from './invite-excuse.ts'
 import { makeTee, outEntry, safeTee, teeInbound, isGroupChatId, TEE_DIR, type Tee } from './post-log.ts'
 
 export const EXIT = { NOTHING: 0, USAGE: 2, PEEK_FAILED: 3, REFUSED: 4, DELIVER: 10 } as const
@@ -58,8 +69,12 @@ const DEADLINE_MS = 12_000
 
 type TeeArgs = Parameters<typeof teeInbound>[0]
 
+export type Ack = { chat_id: string; thread_id?: number }
+
 export type Verdict =
-  | { action: 'deliver'; why: string; ack: { chat_id: string; thread_id?: number } }
+  | { action: 'deliver'; why: string; ack: Ack }
+  /** Wake the agent and post nothing: noAck says why, and is what stdout reports. */
+  | { action: 'deliver'; why: string; noAck: string }
   | { action: 'drop'; why: string; tee?: Omit<TeeArgs, 'tee'> }
 
 export type ClassifyEnv = {
@@ -67,6 +82,14 @@ export type ClassifyEnv = {
   access: GateAccess & { pending?: unknown }
   agent: string
   isStatic: boolean
+}
+
+type GroupMessage = NonNullable<Update['message']>
+
+/** The bridge's own /invite, /excuse and /who plan for one message, against env.access. */
+function groupPlan(m: GroupMessage, env: ClassifyEnv): CommandPlan {
+  const deps = { agent: env.agent, botUsername: () => env.me.username, loadAccess: () => env.access } as unknown as CommandDeps
+  return planGroupCommand(deps, { chat_id: String(m.chat.id), chat_type: m.chat.type, from: m.from, text: m.text, message_thread_id: m.message_thread_id })
 }
 
 /**
@@ -96,9 +119,9 @@ export function classifyUpdate(update: Update, env: ClassifyEnv): Verdict {
     if (text === undefined) return { action: 'drop', why: 'unhandled-kind' }
     const tee = { message: m, chat: m.chat, from: m.from, text }
 
-    const deps = { agent: env.agent, botUsername: () => bot, loadAccess: () => env.access } as unknown as CommandDeps
-    const plan = planGroupCommand(deps, { chat_id, chat_type: m.chat.type, from: m.from, text: m.text, message_thread_id: thread_id })
-    if (plan.kind === 'act') return { action: 'deliver', why: plan.verb, ack: { chat_id, thread_id } }
+    const plan = groupPlan(m, env)
+    // The bridge must launch to apply it, and the bridge answers it.
+    if (plan.kind === 'act') return { action: 'deliver', why: plan.verb, noAck: 'group command' }
     if (plan.kind === 'ignore') return { action: 'drop', why: 'command-not-mine', tee }
 
     const decision = inboundDecision(env.access, ctx, bot, env.agent)
@@ -128,6 +151,39 @@ export function classifyUpdate(update: Update, env: ClassifyEnv): Verdict {
   }
 
   return { action: 'drop', why: 'unhandled-update' }
+}
+
+/**
+ * The update id of an /excuse, among the updates queued behind a deliverable
+ * message, that withdraws it: one in the message's own chat and thread that
+ * this bridge would act on, after which the bridge would no longer deliver
+ * the message. The /excuse is planned and applied by the bridge's own code,
+ * to a copy of access, and the gate is run again on the message against the
+ * result, so a message that tags the agent still delivers and is still
+ * acknowledged. Only a message yields: a button tap or a reaction does not.
+ * In static mode the bridge applies no /excuse, so nothing yields to one.
+ *
+ * BOUND. `later` is the rest of the page already fetched, at most 100
+ * updates. An /excuse beyond it is not seen, and the ack is posted. Fetching
+ * the next page is not an option: its offset would confirm this one.
+ */
+export function excusedBy(u: Update, later: Update[], env: ClassifyEnv): number | undefined {
+  const m = u.message
+  if (!m || env.isStatic) return undefined
+  const chat_id = String(m.chat.id)
+  const key = threadKey(m.message_thread_id)
+  const ctx = new Context(u, {} as Api, env.me)
+  for (const l of later) {
+    if (!l.message) continue
+    const plan = groupPlan(l.message, env)
+    if (plan.kind !== 'act' || plan.verb !== 'excuse') continue
+    if (plan.chat_id !== chat_id) continue
+    if (plan.key !== key) continue
+    const after = structuredClone(env.access)
+    applyGroupCommand(after, chat_id, key, 'excuse')
+    if (inboundDecision(after, ctx, env.me.username, env.agent) !== 'deliver') return l.update_id
+  }
+  return undefined
 }
 
 /** By class and Telegram's own description only: never a URL, never a payload. */
@@ -204,7 +260,7 @@ async function acknowledge(
   api: Api,
   ackFile: string,
   update_id: number,
-  ack: { chat_id: string; thread_id?: number },
+  ack: Ack,
   tee: Tee,
   err: (l: string) => void,
 ): Promise<'sent' | 'already' | 'failed'> {
@@ -300,7 +356,7 @@ export async function main(argv: string[], io = {
     }
     updates.sort((a, b) => a.update_id - b.update_id)
     let dropsThisPage = 0
-    for (const u of updates) {
+    for (const [i, u] of updates.entries()) {
       const v = classifyUpdate(u, env)
       if (v.action === 'deliver') {
         if (dropsThisPage > 0) {
@@ -312,7 +368,13 @@ export async function main(argv: string[], io = {
             io.err(`wake-check ${agent}: drops ahead of update ${u.update_id} not confirmed: ${describeError(e)}\n`)
           }
         }
-        const acked = await acknowledge(api, ackFile, u.update_id, v.ack, tee, io.err)
+        let acked: string
+        if ('noAck' in v) {
+          acked = `skipped (${v.noAck})`
+        } else {
+          const by = excusedBy(u, updates.slice(i + 1), env)
+          acked = by != null ? `skipped (excused by update ${by})` : await acknowledge(api, ackFile, u.update_id, v.ack, tee, io.err)
+        }
         io.out(`wake-check ${agent}: deliverable update ${u.update_id} (${v.why}), ack ${acked}; ${dropped} dropped and confirmed\n`)
         return EXIT.DELIVER
       }
