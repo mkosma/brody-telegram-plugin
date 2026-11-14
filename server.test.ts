@@ -950,6 +950,24 @@ test('who: /who from anyone but Monty spawns nothing and gets no reply', async (
   expect(f.answers()).toEqual([])
 })
 
+test('who: /who verbose passes --verbose to who-hears, and plain /who passes nothing extra', async () => {
+  for (const text of ['/who verbose', '/who@MK_GradyBot verbose', '/WHO Verbose']) {
+    const f = fleetRig()
+    const kinds = await f.send(text)
+    expect(kinds).toEqual({ Vera: 'who', Grady: 'ignore', Werner: 'ignore', Taiichi: 'ignore', Brody: 'ignore', Maya: 'ignore' })
+    expect(f.bridges.flatMap(b => b.whoCalls)).toEqual([{ argv: [WHO_HEARS_BIN, '40', '--chat', GROUP, '--verbose'], timeoutMs: WHO_TIMEOUT_MS }])
+    expect(f.answers().map(a => a.agent)).toEqual(['Vera'])
+  }
+  for (const text of ['/who', '/who@MK_GradyBot', '/who verbosely', '/who verbose please']) {
+    const f = fleetRig()
+    await f.send(text)
+    expect(f.bridges.flatMap(b => b.whoCalls)).toEqual([{ argv: [WHO_HEARS_BIN, '40', '--chat', GROUP], timeoutMs: WHO_TIMEOUT_MS }])
+  }
+  const g = fleetRig()
+  await g.send('/who verbose', null)
+  expect(g.of('Vera').whoCalls[0].argv).toEqual([WHO_HEARS_BIN, 'general', '--chat', GROUP, '--verbose'])
+})
+
 function whoStub(body: string): string {
   const p = join(mkdtempSync(join(tmpdir(), 'who-stub-')), 'who-hears')
   fsWrite(p, `#!/bin/sh\n${body}\n`)
@@ -1061,6 +1079,9 @@ test('all: the parse reads who, all, all but, and mixed', () => {
   expect(parseGroupCommand('/who')).toEqual({ verb: 'who', names: [] })
   expect(parseGroupCommand('/who@MK_VeraBot')).toEqual({ verb: 'who', names: [] })
   expect(parseGroupCommand('/whom')).toBeUndefined()
+  expect(parseGroupCommand('/who verbose')).toEqual({ verb: 'who', names: [], verbose: true })
+  expect(parseGroupCommand('/who@MK_VeraBot verbose')).toEqual({ verb: 'who', names: [], verbose: true })
+  expect(parseGroupCommand('/who verbosely')).toEqual({ verb: 'who', names: [] })
   expect(parseGroupCommand('/excuse all')).toEqual({ verb: 'excuse', names: ['all'], all: { but: [] } })
   expect(parseGroupCommand('/invite all but @Maya MK_GradyBot')).toEqual({ verb: 'invite', names: ['all', 'but', 'maya', 'mk_gradybot'], all: { but: ['maya', 'mk_gradybot'] } })
   expect(parseGroupCommand('/excuse all vera')).toEqual({ verb: 'excuse', names: ['all', 'vera'], mixed: true })

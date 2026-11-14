@@ -63,6 +63,8 @@ export type ParsedCommand = {
   all?: { but: string[] }
   /** `all` beside an explicit name, or a `but` with nothing after it. */
   mixed?: true
+  /** `/who verbose`: the per-bot lines rather than the one line. */
+  verbose?: true
 }
 
 /**
@@ -70,13 +72,14 @@ export type ParsedCommand = {
  * lowercased, without the @. The @ is optional. The text after the verb is
  * split on whitespace and commas, and a token is a name only when the whole
  * of it, less trailing punctuation, is `@?[A-Za-z0-9_]+`: `x@grady.com`
- * names nobody. `/who` carries no names. A list holding the word `all` is
+ * names nobody. `/who` carries no names; `/who verbose` is the only form
+ * that carries a word. A list holding the word `all` is
  * `all`, `all but <names>`, or mixed.
  */
 export function parseGroupCommand(text: string): ParsedCommand | undefined {
   const m = /^\/(invite|excuse|who)(?:@([A-Za-z0-9_]+))?(?=\s|$)([\s\S]*)$/i.exec(text.trim())
   if (!m) return undefined
-  if (m[1].toLowerCase() === 'who') return { verb: 'who', names: [] }
+  if (m[1].toLowerCase() === 'who') return { verb: 'who', names: [], ...(m[3].trim().toLowerCase() === 'verbose' ? { verbose: true as const } : {}) }
   const names = m[3]
     .split(/[\s,]+/)
     .map(t => t.replace(/[.,!?;:]+$/, ''))
@@ -143,8 +146,8 @@ export type CommandPlan =
   | { kind: 'act'; verb: Verb; chat_id: string; thread_id?: number; key: string; quiet?: true; summary?: string }
   /** The answerer's one line with nothing applied here: a refusal, or the summary of an `all` that excludes it. */
   | { kind: 'say'; chat_id: string; thread_id?: number; text: string }
-  /** `/who`, on the answerer's bridge only. */
-  | { kind: 'who'; chat_id: string; thread_id?: number; key: string }
+  /** `/who`, on the answerer's bridge only. `verbose`: `/who verbose`. */
+  | { kind: 'who'; chat_id: string; thread_id?: number; key: string; verbose?: true }
 
 export type CommandDeps<A extends CommandAccess = CommandAccess> = {
   /** This bridge's agent, as the claude() wrapper verified it, or '<Agent>'. */
@@ -176,7 +179,7 @@ export function planGroupCommand<A extends CommandAccess>(deps: CommandDeps<A>, 
   if (bot) mine.add(bot.toLowerCase())
   const at = { chat_id: msg.chat_id, thread_id: msg.message_thread_id, key: threadKey(msg.message_thread_id) }
   const answerer = deps.agent === WHO_ANSWERER
-  if (cmd.verb === 'who') return answerer ? { kind: 'who', ...at } : { kind: 'ignore' }
+  if (cmd.verb === 'who') return answerer ? { kind: 'who', ...at, ...(cmd.verbose ? { verbose: true as const } : {}) } : { kind: 'ignore' }
   if (cmd.mixed) return answerer ? { kind: 'say', chat_id: at.chat_id, thread_id: at.thread_id, text: MIXED_ANSWER } : { kind: 'ignore' }
   if (cmd.all) {
     const summary = answerer ? allSummary(cmd.verb, cmd.all.but) : undefined
@@ -277,13 +280,13 @@ export function whoFailure(rc: number, stderr: string): string {
 }
 
 /**
- * Answer `/who`: `who-hears <thread key> --chat <chat_id>`, bounded, and its
- * stdout posted into the command's thread. Resolves 'answered' or 'failed',
+ * Answer `/who`: `who-hears <thread key> --chat <chat_id>`, with `--verbose`
+ * for `/who verbose`, bounded, and its stdout posted into the command's thread. Resolves 'answered' or 'failed',
  * never rejects.
  */
 export async function runWho(deps: WhoDeps, plan: Extract<CommandPlan, { kind: 'who' }>): Promise<'answered' | 'failed'> {
   const stderr = deps.stderr ?? ((l: string) => { process.stderr.write(l) })
-  const r = await deps.run([deps.bin ?? WHO_HEARS_BIN, plan.key, '--chat', plan.chat_id], deps.timeoutMs ?? WHO_TIMEOUT_MS)
+  const r = await deps.run([deps.bin ?? WHO_HEARS_BIN, plan.key, '--chat', plan.chat_id, ...(plan.verbose ? ['--verbose'] : [])], deps.timeoutMs ?? WHO_TIMEOUT_MS)
   const out = r.stdout.trim()
   const ok = r.rc === 0 && out.length > 0
   if (!ok) stderr(`telegram channel: who-hears failed: rc=${r.rc} ${r.stderr}\n`)
