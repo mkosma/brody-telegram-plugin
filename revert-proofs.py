@@ -331,8 +331,8 @@ REVERTS = [
      "server wiring: polls ALLOWED_UPDATES and takes every handler text from inboundText"),
     # SPEC-bridge-who-and-all-2026-11-12
     ("A1", "/who answerer", "invite-excuse.ts",
-     "  if (cmd.verb === 'who') return answerer ? { kind: 'who', ...at } : { kind: 'ignore' }\n",
-     "  if (cmd.verb === 'who') return { kind: 'who', ...at }\n",
+     "  if (cmd.verb === 'who') return answerer ? { kind: 'who', ...at, ...(cmd.verbose ? { verbose: true as const } : {}) } : { kind: 'ignore' }\n",
+     "  if (cmd.verb === 'who') return { kind: 'who', ...at, ...(cmd.verbose ? { verbose: true as const } : {}) }\n",
      "who: /who from Monty makes the answerer spawn who-hears once with the thread key, and no other bridge does anything"),
     ("A2", "/who thread key", "invite-excuse.ts",
      "[deps.bin ?? WHO_HEARS_BIN, plan.key, '--chat', plan.chat_id, ",
