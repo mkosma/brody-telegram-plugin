@@ -1306,6 +1306,83 @@ test('presence: the invite instruction reads 24h, and /who tells who-hears when 
   expect(vera.whoCalls.map(c => c.argv)).toEqual([[WHO_HEARS_BIN, '40', '--chat', GROUP, '--no-forum', '--verbose']])
 })
 
+// Amendment A. A new topic has no thread entry, so its creator invites itself
+// on a successful create, by the code /invite runs. Each rig is one bot's own
+// access.json; the api is a stub, so no topic is created anywhere.
+import { runCreateForumTopic } from './forum-topic.ts'
+
+const absentEverywhere = (): CommandAccess => ({ allowFrom: [String(MONTY)], groups: { [GROUP]: { requireMention: false, allowFrom: [], threads: { '40': { requireMention: false } } } } })
+
+function createRig(opts: { isStatic?: boolean } = {}) {
+  const g = commandRig({ access: absentEverywhere(), isStatic: opts.isStatic })
+  const calls: unknown[][] = []
+  const stderr: string[] = []
+  const api = { async createForumTopic(...a: unknown[]) { calls.push(a); return { message_thread_id: 77, name: 'Plans' } } }
+  const create = (assertAllowedChat: (c: string) => void = () => {}) =>
+    runCreateForumTopic({ api, assertAllowedChat, isStatic: g.deps.isStatic, loadAccess: g.deps.loadAccess, saveAccess: g.deps.saveAccess, stderr: l => { stderr.push(l) } }, { chat_id: GROUP, name: 'Plans' })
+  return { ...g, calls, stderr, api, create }
+}
+
+test('presence A: after create_forum_topic the creator is present in the new topic and a second bot is absent', async () => {
+  const creator = createRig()
+  const second = commandRig({ agent: 'Vera', bot: 'MK_VeraBot', access: absentEverywhere() })
+  // Before: a topic nobody was invited to reaches nobody.
+  expect(forumGate(creator.access(), 'morning all', 77)).toBe('drop')
+  const res = await creator.create()
+  expect(creator.calls).toEqual([[GROUP, 'Plans']])
+  expect(res.isError).toBeUndefined()
+  expect(res.content[0].text).toBe('created topic "Plans" (message_thread_id: 77)')
+  // The creator's own entry, written once, and nothing else in its access moved.
+  expect(creator.access().groups[GROUP].threads).toEqual({ '40': { requireMention: false }, '77': { requireMention: false } })
+  expect({ ...creator.access(), groups: undefined }).toEqual({ ...absentEverywhere(), groups: undefined })
+  expect(creator.access().groups[GROUP].requireMention).toBe(false)
+  expect(creator.saves.length).toBe(1)
+  // No arrival phrase and no invite event: the tool result is the agent's notice.
+  // Nothing is posted, not even attempted: an attempt would land on stderr.
+  expect(creator.stderr).toEqual([])
+  expect(creator.answers).toEqual([])
+  expect(creator.events).toEqual([])
+  // Present: an un-mentioned post in the new topic is delivered to the creator.
+  expect(forumGate(creator.access(), 'morning all', 77)).toBe('deliver')
+  expect(requireMentionFor(creator.access().groups[GROUP], 77, true)).toBe(false)
+  // The second bot: nothing written, and the same post is dropped.
+  expect(second.access()).toEqual(absentEverywhere())
+  expect(second.saves).toEqual([])
+  expect(inboundDecision({ dmPolicy: 'allowlist', ...second.access() } as GateAccess, { from: { id: MONTY }, chat: FORUM as any, message: { text: 'morning all', message_thread_id: 77 } }, 'MK_VeraBot', 'Vera')).toBe('drop')
+  expect(requireMentionFor(second.access().groups[GROUP], 77, true)).toBe(true)
+})
+
+test('presence A: a create that fails, or a chat not allowed, writes nothing; a static bridge or a failed write says the bot is not present', async () => {
+  const failing = createRig()
+  failing.api.createForumTopic = async () => { throw new Error('Bad Request: not enough rights to manage topics') }
+  await expect(failing.create()).rejects.toThrow('not enough rights')
+  const denied = createRig()
+  await expect(denied.create(() => { throw new Error('chat is not allowlisted') })).rejects.toThrow('not allowlisted')
+  expect(denied.calls).toEqual([])
+  for (const g of [failing, denied]) {
+    expect(g.saves).toEqual([])
+    expect(g.access()).toEqual(absentEverywhere())
+  }
+  // The topic exists, so neither is an error; the text says what did not happen.
+  const stat = createRig({ isStatic: true })
+  const s = await stat.create()
+  expect(s.isError).toBeUndefined()
+  expect(s.content[0].text).toBe('created topic "Plans" (message_thread_id: 77). This bot is NOT present in it (access is static): it hears only mentions there until Monty invites it.')
+  expect(stat.access()).toEqual(absentEverywhere())
+  const erofs = createRig()
+  erofs.deps.saveAccess = () => { throw new Error('EROFS') }
+  const e = await erofs.create()
+  expect(e.content[0].text).toContain('This bot is NOT present in it (the access.json write failed)')
+  expect(erofs.access()).toEqual(absentEverywhere())
+  expect([...stat.answers, ...erofs.answers, ...stat.events, ...erofs.events]).toEqual([])
+})
+
+test('presence A: the server creates a topic through runCreateForumTopic, with the access the gate reads', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  expect(src).toContain("return await runCreateForumTopic({ api: bot.api, assertAllowedChat, isStatic: STATIC, loadAccess, saveAccess }, args)")
+  expect(src).not.toContain('bot.api.createForumTopic(')
+})
+
 // D6. who-hears is Vera's, in the agents repo; /who answers from it, so it
 // must decide presence as the gate does. This loads the script's own
 // setting() and compares it with requireMentionFor on every case. It reads

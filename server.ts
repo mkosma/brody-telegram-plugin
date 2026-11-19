@@ -35,7 +35,7 @@ import { PhrasePicker, phrasesFile } from './phrases.ts'
 import { type GroupPolicy } from './group-gate.ts'
 import { inboundDecision, inboundText, safeName, parseEnvFile, ALLOWED_UPDATES } from './inbound-gate.ts'
 import { relayTags, RelayLimiter, spawnRunner, readRoster, type RelayRequest } from './tag-relay.ts'
-import { runEditForumTopic } from './forum-topic.ts'
+import { runCreateForumTopic, runEditForumTopic } from './forum-topic.ts'
 import { openTapped, tappedLabel, type OmfTapDeps } from './omf-tap.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -566,7 +566,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     // Feature 1: forum topic management
     {
       name: 'create_forum_topic',
-      description: 'Create a new topic in a Telegram forum/supergroup chat. Requires the chat to have topics enabled (BotFather: /setbottopics). Returns the new topic\'s message_thread_id for use in reply\'s message_thread_id parameter.',
+      description: 'Create a new topic in a Telegram forum/supergroup chat. Requires the chat to have topics enabled (BotFather: /setbottopics). Returns the new topic\'s message_thread_id for use in reply\'s message_thread_id parameter. This bot is present in the topic it creates (it hears every post there); every other bot joins by /invite or by a mention from Monty.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -628,20 +628,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'edit_message':
         return await runEditMessage({ api: bot.api, assertAllowedChat, tee }, args)
-      case 'create_forum_topic': {
-        // Feature 1: create a new forum topic in a supergroup with topics enabled.
-        assertAllowedChat(args.chat_id as string)
-        const topic = await bot.api.createForumTopic(
-          args.chat_id as string,
-          args.name as string,
-        )
-        return {
-          content: [{
-            type: 'text',
-            text: `created topic "${topic.name}" (message_thread_id: ${topic.message_thread_id})`,
-          }],
-        }
-      }
+      case 'create_forum_topic':
+        // Feature 1: create a new forum topic; the creator is present in it (forum-topic.ts).
+        return await runCreateForumTopic({ api: bot.api, assertAllowedChat, isStatic: STATIC, loadAccess, saveAccess }, args)
       case 'edit_forum_topic':
         return await runEditForumTopic({ api: bot.api, assertAllowedChat }, args)
       default:

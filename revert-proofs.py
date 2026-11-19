@@ -8,7 +8,8 @@ acceptance case carries a revert that goes red. Extended again for
 SPEC-on-call-agents-wake-and-sleep-2026-11-09, "The wake check" (ids W*).
 Extended for SPEC-bridge-who-and-all-2026-11-12 (ids A*). Extended for
 SPEC-bridge-polls-only-after-initialized-2026-11-12 (ids PG*). Extended for
-SPEC-bridge-presence-by-invite-2026-11-19 (ids D*, one or more per drill).
+SPEC-bridge-presence-by-invite-2026-11-19 (ids D*, one or more per drill;
+DA* are its amendment A, the creator present in a topic it creates).
 
 The baseline includes "presence D6", which loads Vera's who-hears from the
 agents repo and requires it to agree with the gate. To run against a copy of
@@ -452,6 +453,23 @@ REVERTS = [
      "  return reply.message_id != null && reply.message_id === message?.message_thread_id\n",
      "  return true\n",
      "thread gate: a quote-reply to the bot's own post in a topic it created is still a mention"),
+    # SPEC-bridge-presence-by-invite-2026-11-19, amendment A
+    ("DA", "creator present", "forum-topic.ts",
+     "  const present = await runGroupCommand<A>(\n    { ...deps, agent: '', botUsername: () => '', phrase: () => '', answer: async () => { throw new Error('create_forum_topic posts nothing') }, notify: () => {} },\n    { kind: 'act', verb: 'invite', chat_id, thread_id: thread, key: threadKey(thread), quiet: true },\n  )\n",
+     "  const present = 'changed' as string\n",
+     "presence A: after create_forum_topic the creator is present in the new topic and a second bot is absent"),
+    ("DAq", "creator quiet", "forum-topic.ts",
+     "key: threadKey(thread), quiet: true },",
+     "key: threadKey(thread) },",
+     "presence A: after create_forum_topic the creator is present in the new topic and a second bot is absent"),
+    ("DAs", "creator static", "forum-topic.ts",
+     "(absent ? `. This bot is NOT present",
+     "(false ? `. This bot is NOT present",
+     "presence A: a create that fails, or a chat not allowed, writes nothing; a static bridge or a failed write says the bot is not present"),
+    ("DAw", "create wiring", "server.ts",
+     "        return await runCreateForumTopic({ api: bot.api, assertAllowedChat, isStatic: STATIC, loadAccess, saveAccess }, args)\n",
+     "        return { content: [{ type: 'text', text: `created topic \"${(await bot.api.createForumTopic(args.chat_id as string, args.name as string)).name}\"` }] }\n",
+     "presence A: the server creates a topic through runCreateForumTopic, with the access the gate reads"),
     ("PG1", "poll gate", "server.ts",
      "  if (!(await clientInitialized)) {",
      "  if (false) {",
