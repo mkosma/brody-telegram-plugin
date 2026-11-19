@@ -431,6 +431,47 @@ test('wake classify: an /invite or /excuse naming this agent delivers even where
   expect(classifyUpdate(unknownGroup(`/invite@${BOT}`, STRANGER), env()).action).toBe('drop')
 })
 
+// SPEC-bridge-presence-by-invite-2026-11-19, D5.
+const OPEN_GROUP: GateAccess = {
+  dmPolicy: 'allowlist',
+  allowFrom: ['111'],
+  groups: { [String(GROUP_ID)]: { requireMention: false, allowFrom: [], threads: { '40': { requireMention: false }, '333': { requireMention: true } } } },
+}
+
+test('presence D5: a Monty mention in an absent topic is a wake, as the invite it stands for; chatter there is not', () => {
+  const e = env(OPEN_GROUP)
+  // Group level false, topic 77 never entered: un-mentioned chatter no longer wakes.
+  expect(classifyUpdate(grp('morning', 77), e)).toMatchObject({ action: 'drop', why: 'gate' })
+  expect(classifyUpdate(grp('morning'), e)).toMatchObject({ action: 'drop', why: 'gate' })
+  // His mention there wakes the agent, and is acknowledged in its thread.
+  const u = grp('@testy are you there?', 77)
+  expect(classifyUpdate(u, e)).toEqual({ action: 'deliver', why: 'mention-invite', ack: { chat_id: String(GROUP_ID), thread_id: 77 } })
+  expect(classifyUpdate(grp('@testy come back', 333), e)).toMatchObject({ action: 'deliver', why: 'mention-invite' })
+  // In a topic it is present in, a mention is an ordinary delivery.
+  expect(classifyUpdate(grp('@testy', 40), e)).toMatchObject({ action: 'deliver', why: 'group' })
+  // A stranger's mention still wakes, as before, but stands for no invite.
+  expect(classifyUpdate(grp('@testy', 77, STRANGER), e)).toMatchObject({ action: 'deliver', why: 'group' })
+  // A static bridge applies no invite.
+  expect(classifyUpdate(u, env(OPEN_GROUP, true))).toMatchObject({ action: 'deliver', why: 'group' })
+  // The peek changes nothing: the invite is the woken bridge's to apply.
+  expect(e.access).toEqual(OPEN_GROUP)
+})
+
+test('presence D5: end to end, chatter in an absent topic is confirmed and the mention behind it exits 10 unconfirmed', async () => {
+  const chatter = grp('morning', 77)
+  const mention = grp('@testy are you there?', 77)
+  const f = fixture(OPEN_GROUP)
+  const s = startStub([chatter, mention])
+  const r = await runWake(f.home, s.url)
+  expect(r.rc).toBe(EXIT.DELIVER)
+  expect(r.out).toContain(`deliverable update ${mention.update_id} (mention-invite), ack sent; 1 dropped and confirmed`)
+  expect(s.pending.map(u => u.update_id)).toEqual([mention.update_id])
+  expect(sends(s).map(c => [c.body.text, c.body.message_thread_id])).toEqual([[ACK_TEXT, 77]])
+  expect(lines(f.teeFile).filter(l => l.dir === 'in').map(l => [l.text, l.delivered])).toEqual([['morning', false]])
+  // The fixture access.json is read, never written.
+  expect(JSON.parse(readFileSync(join(f.stateDir, 'access.json'), 'utf8'))).toEqual(OPEN_GROUP)
+})
+
 test("wake classify: a stranger's DM is a drop under every dmPolicy, and disabled drops Monty too", () => {
   const pairing: GateAccess = { ...ACCESS, dmPolicy: 'pairing' }
   expect(classifyUpdate(dm('hi', STRANGER), env(pairing))).toMatchObject({ action: 'drop', why: 'pairing' })

@@ -10,6 +10,13 @@
  *
  * SPEC-bridge-names-invite-excuse-2026-11-09, item 1: `@<name>` for this
  * bridge's agent counts as a mention with no configuration.
+ *
+ * SPEC-bridge-presence-by-invite-2026-11-19, item 1: in a forum (a chat whose
+ * `is_forum` is true) presence is the thread entry and nothing else. A thread
+ * with `requireMention:false` is present and hears every post. A thread with
+ * no entry, or with `requireMention:true`, is absent and hears only a
+ * mention, whatever the group's own setting says. A group that is not a forum
+ * has no topics to be invited to, and decides as before.
  */
 
 export type ThreadPolicy = { requireMention?: boolean }
@@ -42,8 +49,9 @@ export function threadKey(threadId: number | undefined): string {
   return threadId != null ? String(threadId) : 'general'
 }
 
-export function requireMentionFor(policy: GroupPolicy, threadId: number | undefined): boolean {
+export function requireMentionFor(policy: GroupPolicy, threadId: number | undefined, isForum = false): boolean {
   const thread = policy.threads?.[threadKey(threadId)]
+  if (isForum) return thread?.requireMention !== false
   return thread?.requireMention ?? policy.requireMention ?? true
 }
 
@@ -97,11 +105,12 @@ export function groupDecision(
   botUsername: string,
   mentionPatterns?: string[],
   agent?: string,
+  isForum = false,
 ): 'deliver' | 'drop' {
   if (!policy) return 'drop'
   const groupAllowFrom = policy.allowFrom ?? []
   if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) return 'drop'
-  const requireMention = requireMentionFor(policy, message?.message_thread_id)
+  const requireMention = requireMentionFor(policy, message?.message_thread_id, isForum)
   if (requireMention && !isMentioned(message, botUsername, mentionPatterns, agent)) return 'drop'
   return 'deliver'
 }

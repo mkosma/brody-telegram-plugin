@@ -37,12 +37,20 @@
  * WHO_ANSWERER bridge alone posts one summary, built from the parse, even
  * when `but` excludes it. `all` beside an explicit name is refused, by the
  * answerer alone, and nothing is applied.
+ *
+ * SPEC-bridge-presence-by-invite-2026-11-19 item 2: A MENTION INVITES. In a
+ * forum, a mention of this bot (its @username, its name, a mentionPatterns
+ * match, or a reply to its message) from a top-level `allowFrom` sender, in a
+ * topic the bot is absent from, is an /invite for that topic.
+ * planMentionInvite returns the plan /invite itself would, runGroupCommand
+ * applies it, and the message is then delivered as the mention it is. From
+ * anyone else the mention is delivered as before and changes nothing.
  */
 
 import { spawn } from 'child_process'
 import { homedir } from 'os'
 import { join } from 'path'
-import { threadKey, type GroupPolicy } from './group-gate.ts'
+import { groupDecision, requireMentionFor, threadKey, type GateMessage, type GroupPolicy } from './group-gate.ts'
 
 export type Verb = 'invite' | 'excuse'
 
@@ -132,6 +140,8 @@ export type CommandMessage = {
   /** The message's text; a caption is never a command. */
   text?: string
   message_thread_id?: number
+  /** The chat is a forum: its topics are what a bot is invited to. */
+  is_forum?: boolean
 }
 
 export type CommandPlan =
@@ -146,8 +156,8 @@ export type CommandPlan =
   | { kind: 'act'; verb: Verb; chat_id: string; thread_id?: number; key: string; quiet?: true; summary?: string }
   /** The answerer's one line with nothing applied here: a refusal, or the summary of an `all` that excludes it. */
   | { kind: 'say'; chat_id: string; thread_id?: number; text: string }
-  /** `/who`, on the answerer's bridge only. `verbose`: `/who verbose`. */
-  | { kind: 'who'; chat_id: string; thread_id?: number; key: string; verbose?: true }
+  /** `/who`, on the answerer's bridge only. `verbose`: `/who verbose`. `flat`: the chat is not a forum. */
+  | { kind: 'who'; chat_id: string; thread_id?: number; key: string; verbose?: true; flat?: true }
 
 export type CommandDeps<A extends CommandAccess = CommandAccess> = {
   /** This bridge's agent, as the claude() wrapper verified it, or '<Agent>'. */
@@ -179,7 +189,7 @@ export function planGroupCommand<A extends CommandAccess>(deps: CommandDeps<A>, 
   if (bot) mine.add(bot.toLowerCase())
   const at = { chat_id: msg.chat_id, thread_id: msg.message_thread_id, key: threadKey(msg.message_thread_id) }
   const answerer = deps.agent === WHO_ANSWERER
-  if (cmd.verb === 'who') return answerer ? { kind: 'who', ...at, ...(cmd.verbose ? { verbose: true as const } : {}) } : { kind: 'ignore' }
+  if (cmd.verb === 'who') return answerer ? { kind: 'who', ...at, ...(cmd.verbose ? { verbose: true as const } : {}), ...(msg.is_forum ? {} : { flat: true as const }) } : { kind: 'ignore' }
   if (cmd.mixed) return answerer ? { kind: 'say', chat_id: at.chat_id, thread_id: at.thread_id, text: MIXED_ANSWER } : { kind: 'ignore' }
   if (cmd.all) {
     const summary = answerer ? allSummary(cmd.verb, cmd.all.but) : undefined
@@ -188,6 +198,29 @@ export function planGroupCommand<A extends CommandAccess>(deps: CommandDeps<A>, 
   }
   if (!cmd.names.some(n => mine.has(n))) return { kind: 'ignore' }
   return { kind: 'act', verb: cmd.verb, ...at }
+}
+
+export type MentionMessage = CommandMessage & { message?: GateMessage }
+
+export type MentionDeps<A extends CommandAccess = CommandAccess> = Pick<CommandDeps<A & { mentionPatterns?: string[] }>, 'agent' | 'botUsername' | 'isStatic' | 'loadAccess'>
+
+/**
+ * The /invite a mention stands for, or undefined when the message is not one:
+ * a forum topic this bot is absent from, in a group it has an entry for, and
+ * a mention the gate delivers, from a top-level `allowFrom` sender who is not
+ * a bot. The same AUTHORITY as /invite: only Monty may change presence. A
+ * static bridge can apply nothing, so its mentions stay plain mentions.
+ */
+export function planMentionInvite<A extends CommandAccess>(deps: MentionDeps<A>, msg: MentionMessage): Extract<CommandPlan, { kind: 'act' }> | undefined {
+  if (msg.chat_type !== 'group' && msg.chat_type !== 'supergroup') return undefined
+  if (!msg.is_forum || deps.isStatic) return undefined
+  if (!msg.from || msg.from.is_bot) return undefined
+  const access = deps.loadAccess()
+  if (!access.allowFrom.includes(String(msg.from.id))) return undefined
+  const policy = access.groups[msg.chat_id]
+  if (!policy || !requireMentionFor(policy, msg.message_thread_id, true)) return undefined
+  if (groupDecision(policy, String(msg.from.id), msg.message, deps.botUsername(), access.mentionPatterns, deps.agent, true) !== 'deliver') return undefined
+  return { kind: 'act', verb: 'invite', chat_id: msg.chat_id, thread_id: msg.message_thread_id, key: threadKey(msg.message_thread_id) }
 }
 
 export type CommandResult = 'changed' | 'unchanged' | 'static' | 'failed'
@@ -280,13 +313,14 @@ export function whoFailure(rc: number, stderr: string): string {
 }
 
 /**
- * Answer `/who`: `who-hears <thread key> --chat <chat_id>`, with `--verbose`
- * for `/who verbose`, bounded, and its stdout posted into the command's thread. Resolves 'answered' or 'failed',
+ * Answer `/who`: `who-hears <thread key> --chat <chat_id>`, with `--no-forum`
+ * for a chat that is not a forum (who-hears must decide as the gate does) and
+ * `--verbose` for `/who verbose`, bounded, and its stdout posted into the command's thread. Resolves 'answered' or 'failed',
  * never rejects.
  */
 export async function runWho(deps: WhoDeps, plan: Extract<CommandPlan, { kind: 'who' }>): Promise<'answered' | 'failed'> {
   const stderr = deps.stderr ?? ((l: string) => { process.stderr.write(l) })
-  const r = await deps.run([deps.bin ?? WHO_HEARS_BIN, plan.key, '--chat', plan.chat_id, ...(plan.verbose ? ['--verbose'] : [])], deps.timeoutMs ?? WHO_TIMEOUT_MS)
+  const r = await deps.run([deps.bin ?? WHO_HEARS_BIN, plan.key, '--chat', plan.chat_id, ...(plan.flat ? ['--no-forum'] : []), ...(plan.verbose ? ['--verbose'] : [])], deps.timeoutMs ?? WHO_TIMEOUT_MS)
   const out = r.stdout.trim()
   const ok = r.rc === 0 && out.length > 0
   if (!ok) stderr(`telegram channel: who-hears failed: rc=${r.rc} ${r.stderr}\n`)

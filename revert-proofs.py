@@ -7,7 +7,12 @@ SPEC-bridge-names-invite-excuse-2026-11-09 (ids N*, L*, I*), whose every
 acceptance case carries a revert that goes red. Extended again for
 SPEC-on-call-agents-wake-and-sleep-2026-11-09, "The wake check" (ids W*).
 Extended for SPEC-bridge-who-and-all-2026-11-12 (ids A*). Extended for
-SPEC-bridge-polls-only-after-initialized-2026-11-12 (ids PG*).
+SPEC-bridge-polls-only-after-initialized-2026-11-12 (ids PG*). Extended for
+SPEC-bridge-presence-by-invite-2026-11-19 (ids D*, one or more per drill).
+
+The baseline includes "presence D6", which loads Vera's who-hears from the
+agents repo and requires it to agree with the gate. To run against a copy of
+who-hears that has not landed, set WHO_HEARS_BIN_UNDER_TEST to its path.
 
 Each revert is applied to a COPY of this tree in a temp dir (node_modules is
 symlinked in), never to the tree itself. A revert whose text is not found
@@ -176,7 +181,7 @@ REVERTS = [
      "    if (command.kind === 'act') await runGroupCommand(deps, command)\n  }\n",
      "invite: handleInbound plans the command before gate() and never delivers it as chat"),
     ("I13", "/invite wiring", "server.ts",
-     "On an invite, read the topic with `tail-fleet-posts --thread <id> --since 2h` before you answer; you were not following it.",
+     "On an invite, read the topic with `tail-fleet-posts --thread <id> --since 24h` before you answer; you were not following it.",
      "",
      "invite: the MCP instructions tell the agent to read the topic on an invite"),
     ("P1", "phrases", "phrases.ts",
@@ -331,8 +336,8 @@ REVERTS = [
      "server wiring: polls ALLOWED_UPDATES and takes every handler text from inboundText"),
     # SPEC-bridge-who-and-all-2026-11-12
     ("A1", "/who answerer", "invite-excuse.ts",
-     "  if (cmd.verb === 'who') return answerer ? { kind: 'who', ...at, ...(cmd.verbose ? { verbose: true as const } : {}) } : { kind: 'ignore' }\n",
-     "  if (cmd.verb === 'who') return { kind: 'who', ...at, ...(cmd.verbose ? { verbose: true as const } : {}) }\n",
+     "  if (cmd.verb === 'who') return answerer ? { kind: 'who', ...at, ...(cmd.verbose ? { verbose: true as const } : {}), ...(msg.is_forum ? {} : { flat: true as const }) } : { kind: 'ignore' }\n",
+     "  if (cmd.verb === 'who') return { kind: 'who', ...at, ...(cmd.verbose ? { verbose: true as const } : {}), ...(msg.is_forum ? {} : { flat: true as const }) }\n",
      "who: /who from Monty makes the answerer spawn who-hears once with the thread key, and no other bridge does anything"),
     ("A2", "/who thread key", "invite-excuse.ts",
      "[deps.bin ?? WHO_HEARS_BIN, plan.key, '--chat', plan.chat_id, ",
@@ -386,6 +391,55 @@ REVERTS = [
      "m[3].trim().toLowerCase() === 'verbose'",
      "false",
      "all: the parse reads who, all, all but, and mixed"),
+    # SPEC-bridge-presence-by-invite-2026-11-19
+    ("D1", "presence: absent", "group-gate.ts",
+     "  if (isForum) return thread?.requireMention !== false\n",
+     "",
+     "presence D1: an un-entered forum topic drops an un-mentioned post even when the group level is false"),
+    ("D2", "presence: invited", "group-gate.ts",
+     "  if (isForum) return thread?.requireMention !== false\n",
+     "  if (isForum) return true\n",
+     "presence D2: an invited forum topic delivers an un-mentioned post, whatever the group level"),
+    ("D3", "mention invites", "invite-excuse.ts",
+     "  return { kind: 'act', verb: 'invite', chat_id: msg.chat_id, thread_id: msg.message_thread_id, key: threadKey(msg.message_thread_id) }\n",
+     "  return undefined\n",
+     "presence D3: Monty's @mention in an absent topic writes the thread entry, emits the invite event, and delivers the message"),
+    ("D3w", "mention wiring", "server.ts",
+     "  if (mention) await runGroupCommand(deps, mention)\n",
+     "",
+     "presence D3: handleInbound applies a mention invite through runGroupCommand, after the commands and before gate()"),
+    ("D3s", "mention static", "invite-excuse.ts",
+     "  if (!msg.is_forum || deps.isStatic) return undefined\n",
+     "  if (!msg.is_forum) return undefined\n",
+     "presence D3: no mention, a present topic, a non-forum group, an unknown group and a static bridge invite nothing"),
+    ("D4", "mention authority", "invite-excuse.ts",
+     "  if (!access.allowFrom.includes(String(msg.from.id))) return undefined\n",
+     "",
+     "presence D4: a peer bot's @mention, or anyone else's, in an absent topic is delivered and writes nothing"),
+    ("D4b", "mention authority", "invite-excuse.ts",
+     "  if (!msg.from || msg.from.is_bot) return undefined\n",
+     "  if (!msg.from) return undefined\n",
+     "presence D4: a peer bot's @mention, or anyone else's, in an absent topic is delivered and writes nothing"),
+    ("D5", "wake: mention", "wake-check.ts",
+     "    if (planMentionInvite(planDeps(env), { ...planMessage(m), message: m })) {\n      return { action: 'deliver', why: 'mention-invite', ack: { chat_id, thread_id } }\n    }\n",
+     "",
+     "presence D5: a Monty mention in an absent topic is a wake, as the invite it stands for; chatter there is not"),
+    ("D5b", "wake: forum rule", "inbound-gate.ts",
+     "agent, p.chat!.is_forum === true)",
+     "agent, false)",
+     "presence D5: end to end, chatter in an absent topic is confirmed and the mention behind it exits 10 unconfirmed"),
+    ("D6", "who-hears agrees", "group-gate.ts",
+     "  if (isForum) return thread?.requireMention !== false\n",
+     "  if (isForum) return thread?.requireMention === true\n",
+     "presence D6: who-hears and the gate agree on who is present"),
+    ("D7", "invite reads 24h", "server.ts",
+     "--since 24h` before you answer",
+     "--since 2h` before you answer",
+     "presence: the invite instruction reads 24h, and /who tells who-hears when a chat is not a forum"),
+    ("D8", "/who --no-forum", "invite-excuse.ts",
+     "...(plan.flat ? ['--no-forum'] : []), ",
+     "",
+     "presence: the invite instruction reads 24h, and /who tells who-hears when a chat is not a forum"),
     ("PG1", "poll gate", "server.ts",
      "  if (!(await clientInitialized)) {",
      "  if (false) {",

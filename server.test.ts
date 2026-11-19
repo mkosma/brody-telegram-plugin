@@ -489,7 +489,7 @@ test("name mention: gate() passes the bridge's agent name to groupDecision", () 
   const body = src.slice(start, src.indexOf('\n}\n', start))
   expect(body).toContain('inboundDecision(access, ctx, botUsername, ACCESS_AGENT)')
   const shared = readFileSync(join(import.meta.dir, 'inbound-gate.ts'), 'utf8')
-  expect(shared).toMatch(/groupDecision\([^)]*access\.mentionPatterns, agent\)/)
+  expect(shared).toMatch(/groupDecision\([^)]*access\.mentionPatterns, agent, p\.chat!\.is_forum === true\)/)
 })
 
 // Item 1, relay half. Acceptance 2.
@@ -586,7 +586,7 @@ function commandRig(opts: { agent?: string; bot?: string; access?: CommandAccess
   // The same composition server.ts uses: plan synchronously, then run.
   // thread null is the General topic (no message_thread_id).
   const send = async (text: string, thread: number | null = THREAD, from: CommandMessage['from'] = { id: MONTY }) => {
-    const plan = planGroupCommand(deps, { chat_id: GROUP, chat_type: 'supergroup', from, text, ...(thread != null ? { message_thread_id: thread } : {}) })
+    const plan = planGroupCommand(deps, { chat_id: GROUP, chat_type: 'supergroup', is_forum: true, from, text, ...(thread != null ? { message_thread_id: thread } : {}) })
     if (plan.kind === 'act') return runGroupCommand(deps, plan)
     return plan.kind
   }
@@ -740,7 +740,7 @@ test('invite: handleInbound plans the command before gate() and never delivers i
 
 test('invite: the MCP instructions tell the agent to read the topic on an invite', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-  expect(src).toContain('On an invite, read the topic with `tail-fleet-posts --thread <id> --since 2h` before you answer; you were not following it.')
+  expect(src).toContain('On an invite, read the topic with `tail-fleet-posts --thread <id> --since 24h` before you answer; you were not following it.')
 })
 
 // Amendment (agents 16d16c3): the answer is a phrase from the agent's own list.
@@ -901,7 +901,7 @@ function fleetRig(access: () => CommandAccess = openIn40, whoRun?: OutputRunner)
   const send = async (text: string, thread: number | null = THREAD, from: CommandMessage['from'] = { id: MONTY }) => {
     const kinds: Record<string, string> = {}
     for (const b of bridges) {
-      const plan = planCmd(b.rig.deps, { chat_id: GROUP, chat_type: 'supergroup', from, text, ...(thread != null ? { message_thread_id: thread } : {}) })
+      const plan = planCmd(b.rig.deps, { chat_id: GROUP, chat_type: 'supergroup', is_forum: true, from, text, ...(thread != null ? { message_thread_id: thread } : {}) })
       kinds[b.agent] = plan.kind
       if (plan.kind === 'say') await sayGroupCommand(b.rig.deps, plan)
       if (plan.kind === 'who') await runWho({ run: b.run, answer: b.rig.deps.answer, stderr: () => {} }, plan)
@@ -1097,4 +1097,216 @@ test('all: the server runs who-hears through spawnOutput without awaiting it, an
   const block = body.slice(early, body.indexOf('gate(ctx)'))
   expect(block).toContain("if (command.kind === 'who') void runWho({ run: spawnOutput, answer: deps.answer }, command)")
   expect(block).toContain("if (command.kind === 'say') await sayGroupCommand(deps, command)")
+})
+
+// --- SPEC-bridge-presence-by-invite-2026-11-19 -----------------------------------
+// A bot is present in a forum topic only by /invite, and Monty's mention in a
+// topic it is absent from invites it. Drills D1-D4 and D6; D5 is in
+// wake-check.test.ts. Nothing here reaches Telegram or a session: the gate
+// and the plans are pure, and the rig's answer and notify are arrays.
+
+import { planMentionInvite, type MentionMessage } from './invite-excuse.ts'
+import { inboundDecision, type GateAccess } from './inbound-gate.ts'
+import { spawnSync } from 'child_process'
+
+const FORUM = { id: Number(GROUP), type: 'supergroup', is_forum: true }
+// Group level false, as Grady's and Vera's access.json have it: one invited
+// thread (40), one excused thread (333), and thread 77 never entered.
+const presence = (): CommandAccess & { mentionPatterns?: string[] } => ({
+  allowFrom: [String(MONTY)],
+  groups: { [GROUP]: { requireMention: false, allowFrom: [], threads: { '40': { requireMention: false }, '333': { requireMention: true } } } },
+})
+const forumGate = (access: CommandAccess, text: string, thread: number | undefined, from = MONTY, chat: object = FORUM) =>
+  inboundDecision({ dmPolicy: 'allowlist', ...access } as GateAccess, { from: { id: from }, chat: chat as any, message: { text, ...(thread != null ? { message_thread_id: thread } : {}) } }, 'MK_GradyBot', 'Grady')
+
+test('presence D1: an un-entered forum topic drops an un-mentioned post even when the group level is false', () => {
+  expect(forumGate(presence(), 'morning all', 77)).toBe('drop')
+  // General is a topic like any other: no "general" entry, absent.
+  expect(forumGate(presence(), 'morning all', undefined)).toBe('drop')
+  // An excused topic drops too.
+  expect(forumGate(presence(), 'morning all', 333)).toBe('drop')
+  expect(requireMentionFor(presence().groups[GROUP], 77, true)).toBe(true)
+  // A group that is not a forum has no topics: its own setting still decides.
+  expect(forumGate(presence(), 'morning all', undefined, MONTY, { id: Number(GROUP), type: 'supergroup' })).toBe('deliver')
+  expect(requireMentionFor(presence().groups[GROUP], 77)).toBe(false)
+})
+
+test('presence D2: an invited forum topic delivers an un-mentioned post, whatever the group level', () => {
+  expect(forumGate(presence(), 'morning all', 40)).toBe('deliver')
+  const strict = presence()
+  strict.groups[GROUP].requireMention = true
+  expect(forumGate(strict, 'morning all', 40)).toBe('deliver')
+  expect(requireMentionFor(strict.groups[GROUP], 40, true)).toBe(false)
+  // Invited in General by its "general" entry.
+  strict.groups[GROUP].threads!.general = { requireMention: false }
+  expect(forumGate(strict, 'morning all', undefined)).toBe('deliver')
+})
+
+/** handleInbound's order for a message that is no command: the mention plan, its run, then the gate. */
+function mentionRig(opts: { access?: CommandAccess; isStatic?: boolean } = {}) {
+  const g = commandRig({ access: opts.access ?? presence(), isStatic: opts.isStatic })
+  const log: string[] = []
+  const { answer, notify } = g.deps
+  g.deps.answer = async (c, t, th) => { log.push(`answer:${t}`); await answer(c, t, th) }
+  g.deps.notify = (v, k) => { log.push(`event:${v}:${k}`); notify(v, k) }
+  const post = async (m: Partial<MentionMessage> & { text: string }, thread: number | null = 77, from: CommandMessage['from'] = { id: MONTY }) => {
+    const message = { text: m.text, ...(thread != null ? { message_thread_id: thread } : {}), ...(m.message ?? {}) }
+    const msg: MentionMessage = { chat_id: GROUP, chat_type: 'supergroup', is_forum: true, from, text: m.text, ...(thread != null ? { message_thread_id: thread } : {}), ...m, message }
+    expect(planGroupCommand(g.deps, msg).kind).toBe('none')
+    const plan = planMentionInvite(g.deps, msg)
+    if (plan) await runGroupCommand(g.deps, plan)
+    const chat = msg.is_forum ? FORUM : { id: Number(GROUP), type: 'supergroup' }
+    const decision = inboundDecision({ dmPolicy: 'allowlist', ...g.access() } as GateAccess, { from: from && { id: from.id }, chat: chat as any, message }, 'MK_GradyBot', 'Grady')
+    log.push(`gate:${decision}`)
+    return { plan, decision }
+  }
+  return { ...g, log, post }
+}
+
+test("presence D3: Monty's @mention in an absent topic writes the thread entry, emits the invite event, and delivers the message", async () => {
+  const g = mentionRig()
+  const before = g.access()
+  const r = await g.post({ text: '@grady what do you make of this?' })
+  expect(r.plan).toEqual({ kind: 'act', verb: 'invite', chat_id: GROUP, thread_id: 77, key: '77' })
+  expect(g.access().groups[GROUP].threads?.['77']).toEqual({ requireMention: false })
+  expect(g.saves.length).toBe(1)
+  // The other entries, and the group level, are untouched.
+  expect({ ...g.access().groups[GROUP].threads, '77': undefined }).toEqual({ ...before.groups[GROUP].threads, '77': undefined })
+  expect(g.access().groups[GROUP].requireMention).toBe(false)
+  // The arrival phrase, the invite event, and then the message itself.
+  expect(g.log).toEqual(['answer:ARRIVE', 'event:invite:77', 'gate:deliver'])
+  expect(g.answers).toEqual([{ chat_id: GROUP, text: 'ARRIVE', thread_id: 77 }])
+  // He is present now: the next post needs no mention, and invites nothing again.
+  const next = await g.post({ text: 'and another thing' })
+  expect(next).toEqual({ plan: undefined, decision: 'deliver' })
+  expect(g.saves.length).toBe(1)
+
+  // Every kind of mention invites: the bot username, a reply to the bot, a pattern.
+  const byEntity = mentionRig()
+  await byEntity.post({ text: 'hi @MK_GradyBot', message: { entities: [{ type: 'mention', offset: 3, length: 12 }] } })
+  expect(byEntity.log).toEqual(['answer:ARRIVE', 'event:invite:77', 'gate:deliver'])
+  const byReply = mentionRig()
+  await byReply.post({ text: 'yes', message: { reply_to_message: { from: { username: 'MK_GradyBot' } } } })
+  expect(byReply.access().groups[GROUP].threads?.['77']).toEqual({ requireMention: false })
+  const pat = presence()
+  pat.mentionPatterns = ['\\bgrady\\b']
+  const byPattern = mentionRig({ access: pat })
+  await byPattern.post({ text: 'grady, thoughts?' })
+  expect(byPattern.log).toEqual(['answer:ARRIVE', 'event:invite:77', 'gate:deliver'])
+  // An excused topic is absent too, and General keys "general".
+  const excused = mentionRig()
+  await excused.post({ text: '@grady come back' }, 333)
+  expect(excused.access().groups[GROUP].threads?.['333']).toEqual({ requireMention: false })
+  const general = mentionRig()
+  await general.post({ text: '@grady' }, null)
+  expect(general.access().groups[GROUP].threads?.general).toEqual({ requireMention: false })
+  expect(general.answers).toEqual([{ chat_id: GROUP, text: 'ARRIVE' }])
+})
+
+test('presence D3: no mention, a present topic, a non-forum group, an unknown group and a static bridge invite nothing', async () => {
+  const quiet = mentionRig()
+  expect(await quiet.post({ text: 'no name here' })).toEqual({ plan: undefined, decision: 'drop' })
+  const present = mentionRig()
+  expect(await present.post({ text: '@grady' }, 40)).toEqual({ plan: undefined, decision: 'deliver' })
+  const flat = mentionRig()
+  expect((await flat.post({ text: '@grady', is_forum: false })).plan).toBeUndefined()
+  const stat = mentionRig({ isStatic: true })
+  expect(await stat.post({ text: '@grady' })).toEqual({ plan: undefined, decision: 'deliver' })
+  const unknown = mentionRig({ access: { allowFrom: [String(MONTY)], groups: {} } })
+  expect(await unknown.post({ text: '@grady' })).toEqual({ plan: undefined, decision: 'drop' })
+  for (const g of [quiet, present, flat, stat, unknown]) {
+    expect(g.saves).toEqual([])
+    expect(g.answers).toEqual([])
+    expect(g.events).toEqual([])
+  }
+  // A failed write claims nothing; the mention itself is still delivered.
+  const failing = mentionRig()
+  failing.deps.saveAccess = () => { throw new Error('EROFS') }
+  expect((await failing.post({ text: '@grady' })).decision).toBe('deliver')
+  expect(failing.log).toEqual(['gate:deliver'])
+})
+
+test("presence D4: a peer bot's @mention, or anyone else's, in an absent topic is delivered and writes nothing", async () => {
+  // A person outside the top-level allowFrom, a peer bot, and a bot wearing Monty's id.
+  for (const from of [{ id: 222 }, { id: 333, is_bot: true }, { id: MONTY, is_bot: true }]) {
+    const g = mentionRig()
+    const r = await g.post({ text: '@grady over to you' }, 77, from)
+    expect(r).toEqual({ plan: undefined, decision: 'deliver' })
+    expect(g.saves).toEqual([])
+    expect(g.access()).toEqual(presence())
+    expect(g.answers).toEqual([])
+    expect(g.events).toEqual([])
+    // Still absent: their next un-mentioned post drops.
+    expect((await g.post({ text: 'hello?' }, 77, from)).decision).toBe('drop')
+  }
+})
+
+test('presence D3: handleInbound applies a mention invite through runGroupCommand, after the commands and before gate()', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('async function handleInbound(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const early = body.indexOf("if (command.kind !== 'none') {")
+  const plan = body.indexOf('planMentionInvite(deps, { ...commandMessage, message: ctx.message })')
+  const run = body.indexOf('if (mention) await runGroupCommand(deps, mention)')
+  const gateAt = body.indexOf('gate(ctx)')
+  expect(plan).toBeGreaterThan(early)
+  expect(run).toBeGreaterThan(plan)
+  expect(gateAt).toBeGreaterThan(run)
+  expect(body).toContain("is_forum: 'is_forum' in ctx.chat && ctx.chat.is_forum === true,")
+})
+
+test('presence: the invite instruction reads 24h, and /who tells who-hears when a chat is not a forum', async () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  expect(src).toContain('`tail-fleet-posts --thread <id> --since 24h`')
+  expect(src).not.toContain('--since 2h')
+  const f = fleetRig()
+  const vera = f.of('Vera')
+  const flat = planCmd(vera.rig.deps, { chat_id: GROUP, chat_type: 'supergroup', from: { id: MONTY }, text: '/who verbose', message_thread_id: THREAD })
+  expect(flat).toMatchObject({ kind: 'who', flat: true })
+  if (flat.kind === 'who') await runWho({ run: vera.run, answer: vera.rig.deps.answer, stderr: () => {} }, flat)
+  expect(vera.whoCalls.map(c => c.argv)).toEqual([[WHO_HEARS_BIN, '40', '--chat', GROUP, '--no-forum', '--verbose']])
+})
+
+// D6. who-hears is Vera's, in the agents repo; /who answers from it, so it
+// must decide presence as the gate does. This loads the script's own
+// setting() and compares it with requireMentionFor on every case. It reads
+// who-hears at WHO_HEARS_BIN unless WHO_HEARS_BIN_UNDER_TEST names another
+// copy, and only calls setting() on fixture JSON: no access.json, tee log or
+// host is read.
+test('presence D6: who-hears and the gate agree on who is present', () => {
+  const bin = process.env.WHO_HEARS_BIN_UNDER_TEST ?? WHO_HEARS_BIN
+  const policies: Record<string, GroupPolicy> = {
+    'group false': presence().groups[GROUP],
+    'group true': { ...presence().groups[GROUP], requireMention: true },
+    'group false, general invited': { requireMention: false, allowFrom: [], threads: { general: { requireMention: false }, '40': {} } },
+  }
+  const cases = Object.entries(policies).flatMap(([name, policy]) =>
+    [true, false].flatMap(forum =>
+      [40, 333, 77, undefined].map(thread => ({ name, policy, forum, thread, key: thread != null ? String(thread) : 'general' }))))
+  const loader = [
+    'import sys, json, importlib.machinery, importlib.util',
+    'ld = importlib.machinery.SourceFileLoader("who_hears", sys.argv[1])',
+    'spec = importlib.util.spec_from_loader("who_hears", ld)',
+    'wh = importlib.util.module_from_spec(spec)',
+    'ld.exec_module(wh)',
+    'out = []',
+    'for c in json.load(sys.stdin):',
+    '    try:',
+    '        out.append(wh.setting(c["raw"], c["chat"], c["key"]) if c["forum"] else wh.setting(c["raw"], c["chat"], c["key"], False))',
+    '    except Exception as e:',
+    '        out.append("error: %r" % (e,))',
+    'json.dump(out, sys.stdout)',
+  ].join('\n')
+  const input = JSON.stringify(cases.map(c => ({ raw: JSON.stringify({ groups: { [GROUP]: c.policy } }), chat: GROUP, key: c.key, forum: c.forum })))
+  const r = spawnSync('/usr/bin/python3', ['-I', '-B', '-c', loader, bin], { input, encoding: 'utf8', timeout: 20000 })
+  expect(r.stderr).toBe('')
+  expect(r.status).toBe(0)
+  const settings = JSON.parse(r.stdout) as string[]
+  const label = (c: (typeof cases)[number]) => `${c.name} / ${c.forum ? 'forum' : 'not a forum'} / ${c.key}`
+  const says = cases.map((c, i) => `${label(c)}: ${settings[i] === 'hears everything' ? 'present' : settings[i].startsWith('error') ? settings[i] : 'absent'}`)
+  const gate = cases.map(c => `${label(c)}: ${requireMentionFor(c.policy, c.thread, c.forum) ? 'absent' : 'present'}`)
+  expect(says).toEqual(gate)
+  // The spec's fixture, spelled out: group false, 40 invited, 333 excused, 77 never entered.
+  const forum = (key: string) => settings[cases.findIndex(c => c.name === 'group false' && c.forum && c.key === key)]
+  expect([forum('40'), forum('333'), forum('77'), forum('general')]).toEqual(['hears everything', 'excused here', 'only when tagged', 'only when tagged'])
 })
