@@ -36,7 +36,7 @@ export type GateMessage = {
   entities?: Entity[]
   caption_entities?: Entity[]
   message_thread_id?: number
-  reply_to_message?: { from?: { username?: string } }
+  reply_to_message?: { message_id?: number; forum_topic_created?: unknown; from?: { username?: string } }
 }
 
 /**
@@ -65,6 +65,21 @@ export function nameMentionPattern(agent: string | undefined): RegExp | undefine
   return new RegExp(`(^|[^\\w@])@${agent}(?![\\w])`, 'i')
 }
 
+/**
+ * In a forum every plain post in a topic carries reply_to_message = the topic
+ * root (the forum_topic_created service message, whose message_id is the
+ * topic's message_thread_id). That is the client filing the post, not the
+ * sender replying to anyone, so it is no mention: in a topic this bot created
+ * the root is the bot's own message, and counting it would make every post
+ * there a mention and no /excuse could stick.
+ */
+export function repliesToTopicRoot(message: GateMessage | undefined): boolean {
+  const reply = message?.reply_to_message
+  if (!reply) return false
+  if (reply.forum_topic_created != null) return true
+  return reply.message_id != null && reply.message_id === message?.message_thread_id
+}
+
 export function isMentioned(
   message: GateMessage | undefined,
   botUsername: string,
@@ -84,7 +99,7 @@ export function isMentioned(
   }
 
   // Reply to one of our messages counts as an implicit mention.
-  if (message?.reply_to_message?.from?.username === botUsername) return true
+  if (!repliesToTopicRoot(message) && message?.reply_to_message?.from?.username === botUsername) return true
 
   if (nameMentionPattern(agent)?.test(text)) return true
 

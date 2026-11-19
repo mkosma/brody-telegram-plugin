@@ -247,6 +247,26 @@ test('thread gate: a reply to the bot in a gated thread still delivers', () => {
   expect(groupDecision(fleet, '111', m, BOT)).toBe('deliver')
 })
 
+test('thread gate: a post whose reply_to_message is the topic root is no mention, in a topic the bot created', () => {
+  const from = { username: BOT }
+  // A plain post in topic 39, which the bot created: the client files it as a reply to the root.
+  const byId = { text: 'yes', message_thread_id: 39, reply_to_message: { message_id: 39, from } }
+  const byService = { text: 'yes', message_thread_id: 39, reply_to_message: { message_id: 39, forum_topic_created: { name: 'Vera' }, from } }
+  const serviceOnly = { text: 'yes', message_thread_id: 39, reply_to_message: { forum_topic_created: { name: 'Vera' }, from } }
+  for (const m of [byId, byService, serviceOnly]) {
+    expect(isMentioned(m, BOT)).toBe(false)
+    expect(groupDecision(fleet, '111', m, BOT)).toBe('drop')
+  }
+  // An explicit mention in such a post still counts.
+  expect(groupDecision(fleet, '111', { ...byId, text: 'yes @MK_VeraBot', entities: [{ type: 'mention', offset: 4, length: 11 }] }, BOT)).toBe('deliver')
+})
+
+test("thread gate: a quote-reply to the bot's own post in a topic it created is still a mention", () => {
+  const m = { text: 'yes', message_thread_id: 39, reply_to_message: { message_id: 1204, from: { username: BOT } } }
+  expect(isMentioned(m, BOT)).toBe(true)
+  expect(groupDecision(fleet, '111', m, BOT)).toBe('deliver')
+})
+
 test('thread gate: a thread entry can also lift a group-wide requirement', () => {
   const p: GroupPolicy = { requireMention: true, allowFrom: [], threads: { '40': { requireMention: false } } }
   expect(requireMentionFor(p, 40)).toBe(false)
@@ -1201,6 +1221,25 @@ test("presence D3: Monty's @mention in an absent topic writes the thread entry, 
   await general.post({ text: '@grady' }, null)
   expect(general.access().groups[GROUP].threads?.general).toEqual({ requireMention: false })
   expect(general.answers).toEqual([{ chat_id: GROUP, text: 'ARRIVE' }])
+})
+
+test("presence: in a topic the bot created, an /excuse sticks against Monty's plain posts, and his quote-reply to the bot still invites", async () => {
+  // Topic 333 is excused, and its root (message 333) is the bot's own forum_topic_created.
+  const root = { message_id: 333, forum_topic_created: { name: 'Grady' }, from: { username: 'MK_GradyBot' } }
+  const g = mentionRig()
+  const plain = await g.post({ text: 'still thinking out loud', message: { reply_to_message: root } }, 333)
+  expect(plain).toEqual({ plan: undefined, decision: 'drop' })
+  // The id alone marks the root too, as a tee'd or trimmed message carries it.
+  const byId = await g.post({ text: 'and again', message: { reply_to_message: { message_id: 333, from: root.from } } }, 333)
+  expect(byId).toEqual({ plan: undefined, decision: 'drop' })
+  expect(g.access().groups[GROUP].threads?.['333']).toEqual({ requireMention: true })
+  expect(g.saves.length).toBe(0)
+  expect(g.log).toEqual(['gate:drop', 'gate:drop'])
+  // A quote-reply to one of the bot's posts in that topic is a mention, and so an invite.
+  const quote = await g.post({ text: 'yes, do that', message: { reply_to_message: { message_id: 1204, from: root.from } } }, 333)
+  expect(quote.plan).toEqual({ kind: 'act', verb: 'invite', chat_id: GROUP, thread_id: 333, key: '333' })
+  expect(quote.decision).toBe('deliver')
+  expect(g.access().groups[GROUP].threads?.['333']).toEqual({ requireMention: false })
 })
 
 test('presence D3: no mention, a present topic, a non-forum group, an unknown group and a static bridge invite nothing', async () => {
