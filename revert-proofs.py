@@ -11,6 +11,8 @@ SPEC-bridge-polls-only-after-initialized-2026-11-12 (ids PG*). Extended for
 SPEC-bridge-presence-by-invite-2026-11-19 (ids D*, one or more per drill;
 DA* are its amendment A, the creator present in a topic it creates; C* are
 its amendment C, peer bot posts delivered from the post log, drills D7-D12).
+Extended for SPEC-bridge-inbound-context-stamp-2026-11-20 (ids S*, drills
+S1-S6).
 
 The baseline includes "presence D6", which loads Vera's who-hears from the
 agents repo and requires it to agree with the gate. To run against a copy of
@@ -549,6 +551,63 @@ REVERTS = [
      "  setTimeout(() => resolve(false), INIT_WAIT_MS).unref()\n",
      "",
      "poll gate: with no initialized, polling starts at the bound and says so on stderr"),
+    # SPEC-bridge-inbound-context-stamp-2026-11-20, drills S1-S6
+    ("S1", "context stamp", "inbound-context.ts",
+     "deps.run([...argv, '--ts', post.ts], bound).catch(() => undefined)",
+     "Promise.resolve(undefined)",
+     "stamp S1: a post of Monty's carries ctx_* attributes from the command, which is given --ts and nothing else"),
+    ("S1w", "context stamp", "server.ts",
+     "        ...stamp,\n",
+     "",
+     "stamp S1: the server stamps the post it delivers, with its own access list and the bounded runner"),
+    ("S2", "context stamp", "inbound-context.ts",
+     "  if (!post.from || post.from.is_bot || !deps.allowFrom().includes(String(post.from.id))) return {}\n",
+     "",
+     "stamp S2: a peer bot's post carries none, and neither does a post from anyone outside allowFrom"),
+    ("S2b", "context stamp", "inbound-context.ts",
+     "  if (!post.from || post.from.is_bot || !deps.allowFrom()",
+     "  if (!post.from || !deps.allowFrom()",
+     "stamp S2: a peer bot's post carries none, and neither does a post from anyone outside allowFrom"),
+    ("S3", "context stamp", "inbound-context.ts",
+     "  const r = await Promise.race([deps.run([...argv, '--ts', post.ts], bound).catch(() => undefined), late])",
+     "  const r = await deps.run([...argv, '--ts', post.ts], 60_000).catch(() => undefined)",
+     "stamp S3: a command that sleeps 10s is abandoned at the bound, and the post goes out with ctx=\"unknown\""),
+    ("S3b", "context stamp", "inbound-context.ts",
+     "  const r = await Promise.race([deps.run([...argv, '--ts', post.ts], bound).catch(() => undefined), late])",
+     "  const r = await deps.run([...argv, '--ts', post.ts], bound).catch(() => undefined)",
+     "stamp S3: a command that sleeps 10s is abandoned at the bound, and the post goes out with ctx=\"unknown\""),
+    ("S4", "context stamp", "inbound-context.ts",
+     "  if (r.rc !== 0) return unknown(`exited ${r.rc}`)\n",
+     "",
+     "stamp S4: a nonzero exit and empty output each give ctx=\"unknown\" and one stderr line"),
+    ("S4b", "context stamp", "inbound-context.ts",
+     "  if (Object.keys(stamp).length === 0) return unknown('printed no key=value line')\n",
+     "",
+     "stamp S4: a nonzero exit and empty output each give ctx=\"unknown\" and one stderr line"),
+    ("S5", "context stamp", "inbound-context.ts",
+     "  if (argv.length === 0) return {}\n",
+     "",
+     "stamp S5: with the variable unset, nothing is run and the event is byte-identical to today's"),
+    ("S6", "context stamp", "inbound-context.ts",
+     "const CTX_KEY_RE = /^[a-z_]{1,32}$/",
+     "const CTX_KEY_RE = /^.+$/",
+     "stamp S6: junk keys are dropped, long values cut, at most 8 keys kept, and no value can break the attribute syntax"),
+    ("S6b", "context stamp", "inbound-context.ts",
+     ".trim().slice(0, CTX_MAX_VALUE)",
+     ".trim()",
+     "stamp S6: junk keys are dropped, long values cut, at most 8 keys kept, and no value can break the attribute syntax"),
+    ("S6c", "context stamp", "inbound-context.ts",
+     """.replace(/"/g, "'")""",
+     "",
+     "stamp S6: junk keys are dropped, long values cut, at most 8 keys kept, and no value can break the attribute syntax"),
+    ("S6d", "context stamp", "inbound-context.ts",
+     ".replace(/[<>]/g, '_')",
+     "",
+     "stamp S6: junk keys are dropped, long values cut, at most 8 keys kept, and no value can break the attribute syntax"),
+    ("S6e", "context stamp", "inbound-context.ts",
+     "    if (kept >= CTX_MAX_KEYS) break\n",
+     "",
+     "stamp S6: junk keys are dropped, long values cut, at most 8 keys kept, and no value can break the attribute syntax"),
 ]
 
 FAIL_RE = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)
