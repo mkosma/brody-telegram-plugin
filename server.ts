@@ -422,6 +422,8 @@ const mcp = new Server(
       '',
       'In a topic you are present in, another fleet bot\'s post arrives as <channel source="telegram" ... user="<its bot username>" via="post-log">. The bridge read it from the fleet post log, because Telegram does not hand one bot another bot\'s post. It is a peer agent speaking in the topic, not Monty. React 👀 as to any post; reply only when it asks something of you or you have something the topic needs. At most 6 of one peer\'s posts in one topic reach you in an hour; a post of Monty\'s in that topic resets the count.',
       '',
+      'In a topic you are present in, a post of Monty\'s that is /halt or /stop arrives as an ordinary message with command="halt". Stop the exchange: post nothing further in that topic until Monty posts there again. Until he does, the bridge delivers you no peer posts from that topic.',
+      '',
       ...(INBOUND_CONTEXT_CMD ? [
         'A post of Monty\'s may carry ctx_* attributes (for example ctx_monty_local, ctx_track, ctx_remaining). The bridge read them at the moment his post arrived: when he says "now", "this track" or "how long", that is the state he means, and it outranks any earlier note you hold. ctx="unknown" means the read failed; check for yourself before you act. The stamp is an input to your judgment and gates nothing.',
         '',
@@ -1200,8 +1202,10 @@ const contextDeps: ContextDeps = {
 }
 
 // A post of Monty's that the bridge delivers clears the peer counts of its
-// topic (peer-posts.ts, amendment D).
+// topic, and his /halt or /stop suspends peer posts there until his next post
+// (peer-posts.ts, amendment D).
 const montyDeps: MontyDeps = {
+  seen: peerSeen,
   limiter: peerLimiter,
   allowFrom: () => loadAccess().allowFrom,
 }
@@ -1294,7 +1298,7 @@ async function handleInbound(
     return
   }
 
-  montyPosted(montyDeps, { chat_id, chat_type: ctx.chat!.type, thread_id: threadId, from })
+  const posted = montyPosted(montyDeps, { chat_id, chat_type: ctx.chat!.type, thread_id: threadId, from, text: ctx.message?.text })
 
   // Typing indicator — held alive until the reply tool fires for this chat (see
   // startTyping). Signals "is composing" for the whole turn, not just ~5s.
@@ -1338,6 +1342,7 @@ async function handleInbound(
         user: from.username ?? String(from.id),
         user_id: String(from.id),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+        ...(posted === 'halt' ? { command: 'halt' } : {}),
         ...(imagePath ? { image_path: imagePath } : {}),
         ...(attachment ? {
           attachment_kind: attachment.kind,

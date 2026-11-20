@@ -1436,7 +1436,7 @@ test('presence D6: who-hears and the gate agree on who is present', () => {
 
 import { homedir } from 'os'
 import { RELAY_MAX_PER_HOUR } from './tag-relay.ts'
-import { PeerLimiter, montyPosted, topicKey, type MontyDeps } from './peer-posts.ts'
+import { PeerLimiter, montyPosted, topicKey, isHalt, type MontyDeps } from './peer-posts.ts'
 import { SeenPosts, deliverPeerPosts, pollPeerPosts, postKey, PEER_POLL_MS, PEER_READ_TIMEOUT_MS, PEER_LOOKBACK_MS, PEER_OVERLAP_MS, PEER_READ_MAX_CHARS, TAIL_FLEET_POSTS_BIN, type PeerDeps, type PeerEvent, type PeerRecord } from './peer-posts.ts'
 
 const T0 = Date.parse('2026-11-20T08:00:00Z')
@@ -1845,21 +1845,25 @@ test('stamp S6: junk keys are dropped, long values cut, at most 8 keys kept, and
 // "Monty" is a non-bot sender in the top-level allowFrom, never an id.
 // ---------------------------------------------------------------------------
 
+/** Message ids for capRig's peer posts: never reused, so a rig on a shared state file sees new posts. */
+let capPostId = 2000
+
 /** A second invited topic beside 40, so two topics can be told apart. */
-function capRig() {
-  const g = peerRig()
+function capRig(opts: { file?: string } = {}) {
+  const g = peerRig(opts)
   g.deps.groups = () => {
     const a = presence()
     a.groups[GROUP].threads!['41'] = { requireMention: false }
     return a.groups
   }
-  const monty: MontyDeps = { limiter: g.deps.limiter, allowFrom: () => [String(MONTY)] }
-  let id = 2000
+  const monty: MontyDeps = { seen: g.deps.seen, limiter: g.deps.limiter, allowFrom: () => [String(MONTY)] }
   /** One peer post in a topic: was it delivered? */
-  const peer = (thread: number | null, bot = 'MK_MayaBot') => deliverPeerPosts(g.deps, [peerOut(bot, ++id, thread)])[0]?.delivered
-  const says = (thread: number | undefined, from: { id: number; is_bot?: boolean } | null = { id: MONTY }, chat_type = 'supergroup') =>
-    montyPosted(monty, { chat_id: GROUP, chat_type, thread_id: thread, from: from ?? undefined })
-  return { ...g, peer, says }
+  const peer = (thread: number | null, bot = 'MK_MayaBot') => deliverPeerPosts(g.deps, [peerOut(bot, ++capPostId, thread)])[0]?.delivered
+  const says = (thread: number | undefined, from: { id: number; is_bot?: boolean } | null = { id: MONTY }, chat_type = 'supergroup', text: string | undefined = 'carry on') =>
+    montyPosted(monty, { chat_id: GROUP, chat_type, thread_id: thread, from: from ?? undefined, text })
+  /** Monty posts `text` in a topic. */
+  const posts = (text: string | undefined, thread: number | undefined = 40, from: { id: number; is_bot?: boolean } = { id: MONTY }) => says(thread, from, 'supergroup', text)
+  return { ...g, peer, says, posts }
 }
 
 test('cap reset D13: after 6 deliveries from one peer in a topic, a Monty post there lets the 7th through', () => {
@@ -1897,8 +1901,8 @@ test('cap reset D13: only Monty resets: not a peer bot, a stranger, a bot wearin
 test('cap reset D13: the server resets on a post it delivers, with its own access list and the peer limiter', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
   expect(src).toContain('const peerLimiter = new PeerLimiter()\n')
-  expect(src).toContain('const montyDeps: MontyDeps = {\n  limiter: peerLimiter,\n  allowFrom: () => loadAccess().allowFrom,\n')
-  expect(src).toContain('  seen: peerSeen,\n  limiter: peerLimiter,\n')
+  expect(src).toContain('const montyDeps: MontyDeps = {\n  seen: peerSeen,\n  limiter: peerLimiter,\n  allowFrom: () => loadAccess().allowFrom,\n')
+  expect(src).toContain('  seen: peerSeen,\n  limiter: peerLimiter,\n  tee,\n')
   const start = src.indexOf('async function handleInbound(')
   const body = src.slice(start, src.indexOf('\n}\n', start))
   const gateAt = body.indexOf('const result = teeInbound(teeArgs, () => gate(ctx))')
@@ -1937,4 +1941,108 @@ test('cap reset D14: the cap is per topic, and a Monty post in topic A does not 
   expect(lim.take(GROUP, 40, 'mk_mayabot')).toBe(false)
   lim.reset('-100999', 40)
   expect(lim.take(GROUP, 40, 'MK_MayaBot')).toBe(false)
+})
+
+// ---------------------------------------------------------------------------
+// Amendment D, answered by Monty: /halt and /stop suspend peer posts in a
+// topic until his next post there. Drills D19-D22.
+// ---------------------------------------------------------------------------
+
+test("halt D19: after Monty's /halt a peer's post in that topic is not delivered, and his next post lifts it", () => {
+  const g = capRig()
+  for (let i = 0; i < 6; i++) expect(g.peer(40)).toBe(true)
+  expect(g.posts('/halt')).toBe('halt')
+  // It suspends; it does not reset: the six still count.
+  expect(g.deps.seen.halted(topicKey(GROUP, 40))).toBe(true)
+  const held = peerOut('MK_WernerBot', 3001, 40, 'and another thing')
+  expect(deliverPeerPosts(g.deps, [held])).toEqual([{ key: `${GROUP}:3001`, bot: 'MK_WernerBot', delivered: false, skipped: 'halt' }])
+  expect(g.peer(40)).toBe(false)
+  expect(g.events.length).toBe(6)
+  // On the bridge's own record as skipped, with no stderr line: a halt is not a fault.
+  expect(g.logged[6]).toEqual(expect.objectContaining({ message_id: 3001, delivered: false, skipped: 'halt', via: 'post-log' }))
+  expect(g.lines).toEqual([])
+  // The topic, not the bridge: 41 still hears its peers.
+  expect(g.peer(41)).toBe(true)
+  // A second /halt changes nothing, and a suspended post spent none of the bound.
+  expect(g.posts('/halt')).toBe('halt')
+  expect(g.peer(40)).toBe(false)
+  // His next post there lifts it and resets the cap; one in another topic does not.
+  expect(g.posts('ok, carry on', 41)).toBe('reset')
+  expect(g.peer(40)).toBe(false)
+  expect(g.posts('ok, carry on')).toBe('reset')
+  expect(g.deps.seen.halted(topicKey(GROUP, 40))).toBe(false)
+  for (let i = 0; i < 6; i++) expect(g.peer(40)).toBe(true)
+  expect(g.peer(40)).toBe(false)
+  // What a peer said while the topic was suspended is not delivered afterwards.
+  g.posts('go on')
+  expect(deliverPeerPosts(g.deps, [held])).toEqual([])
+  expect(g.events.map(e => e.meta.message_id)).not.toContain('3001')
+})
+
+test('halt D19: the server hands the post to the agent with command="halt" and tells it to stop', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('async function handleInbound(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const dropped = body.indexOf("if (result.action === 'drop') return")
+  const posted = body.indexOf('  const posted = montyPosted(montyDeps, { chat_id, chat_type: ctx.chat!.type, thread_id: threadId, from, text: ctx.message?.text })\n')
+  const meta = body.indexOf("        ...(posted === 'halt' ? { command: 'halt' } : {}),\n")
+  expect(posted).toBeGreaterThan(dropped)
+  expect(meta).toBeGreaterThan(posted)
+  expect(src).toContain('arrives as an ordinary message with command="halt". Stop the exchange: post nothing further in that topic until Monty posts there again.')
+})
+
+test('halt D20: /stop behaves as /halt, in any case and with a bot suffix; anything more is an ordinary post', () => {
+  for (const text of ['/stop', '/STOP', '/Halt', '/halt@MK_GradyBot', '/stop@mk_verabot', '  /stop\n']) {
+    const g = capRig()
+    expect(isHalt(text)).toBe(true)
+    expect(g.posts(text)).toBe('halt')
+    expect(g.peer(40)).toBe(false)
+    expect(g.posts('go on')).toBe('reset')
+    expect(g.peer(40)).toBe(true)
+  }
+  for (const text of ['/halt now', 'halt', 'stop', '/halting', '/stopx', 'please /stop', '/halt @grady', '/stop@', undefined]) {
+    const g = capRig()
+    expect(isHalt(text)).toBe(false)
+    expect(g.posts(text)).toBe('reset')
+    expect(g.peer(40)).toBe(true)
+  }
+})
+
+test('halt D21: the suspension survives a restart, and so does its lifting', () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'peer-halt-')), 'peer-posts.json')
+  const g = capRig({ file })
+  expect(g.posts('/halt')).toBe('halt')
+  expect(JSON.parse(readFileSync(file, 'utf8')).halted).toEqual([topicKey(GROUP, 40)])
+  // A new bridge on the same state file: still suspended, in that topic only.
+  const again = capRig({ file })
+  expect(again.deps.seen.halted(topicKey(GROUP, 40))).toBe(true)
+  expect(again.peer(40)).toBe(false)
+  expect(again.peer(41)).toBe(true)
+  expect(again.logged[0]).toEqual(expect.objectContaining({ delivered: false, skipped: 'halt' }))
+  // His next post lifts it, and the lift is on disk too.
+  expect(again.posts('carry on')).toBe('reset')
+  expect(JSON.parse(readFileSync(file, 'utf8')).halted).toEqual([])
+  const third = capRig({ file })
+  expect(third.peer(40)).toBe(true)
+  // One state file, the one the seen keys live in.
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  expect(src).toContain('const montyDeps: MontyDeps = {\n  seen: peerSeen,\n')
+})
+
+test("halt D22: a peer bot's /halt, or anyone else's, suspends nothing", () => {
+  for (const from of [{ id: 333, is_bot: true }, { id: 222 }, { id: MONTY, is_bot: true }]) {
+    const g = capRig()
+    expect(g.posts('/halt', 40, from)).toBeUndefined()
+    expect(g.posts('/stop', 40, from)).toBeUndefined()
+    expect(g.deps.seen.halted(topicKey(GROUP, 40))).toBe(false)
+    expect(g.peer(40)).toBe(true)
+  }
+  // And nobody but Monty lifts one.
+  const g = capRig()
+  g.posts('/halt')
+  expect(g.posts('carry on', 40, { id: 333, is_bot: true })).toBeUndefined()
+  expect(g.posts('carry on', 40, { id: 222 })).toBeUndefined()
+  expect(g.peer(40)).toBe(false)
+  // In a DM it is not a topic's command.
+  expect(g.says(undefined, { id: MONTY }, 'private', '/halt')).toBeUndefined()
 })
