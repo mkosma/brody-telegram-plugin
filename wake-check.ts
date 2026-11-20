@@ -52,7 +52,7 @@ import { spawnSync } from 'child_process'
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { basename, join } from 'path'
-import { ALLOWED_UPDATES, inboundDecision, inboundText, parseEnvFile, type GateAccess } from './inbound-gate.ts'
+import { ALLOWED_UPDATES, everyoneTagged, inboundDecision, inboundText, parseEnvFile, type GateAccess } from './inbound-gate.ts'
 import { threadKey } from './group-gate.ts'
 import { applyGroupCommand, planGroupCommand, planMentionInvite, type CommandDeps, type CommandPlan } from './invite-excuse.ts'
 import { makeTee, outEntry, safeTee, teeInbound, isGroupChatId, TEE_DIR, type Tee } from './post-log.ts'
@@ -137,7 +137,10 @@ export function classifyUpdate(update: Update, env: ClassifyEnv): Verdict {
 
     const decision = inboundDecision(env.access, ctx, bot, env.agent)
     if (decision === 'deliver') {
-      return { action: 'deliver', why: m.chat.type === 'private' ? 'dm' : 'group', ack: { chat_id, thread_id } }
+      // Monty's @everyone in a topic the bot is present in is a tag to it,
+      // and wakes it as a mention does.
+      const why = m.chat.type === 'private' ? 'dm' : everyoneTagged(env.access, ctx) ? 'everyone' : 'group'
+      return { action: 'deliver', why, ack: { chat_id, thread_id } }
     }
     return { action: 'drop', why: decision === 'pair' ? 'pairing' : 'gate', tee }
   }

@@ -25,17 +25,31 @@
  * gate's own function. In an absent topic nothing is delivered from the log;
  * a peer's tag there still travels by the tag relay.
  *
- * LOOP BOUND. The tag relay's rule: at most RELAY_MAX_PER_HOUR deliveries per
- * hour per (sending bot, receiving bot) pair. Past it the post is logged as
- * skipped and one stderr line is written.
+ * LOOP BOUND. The tag relay's number: at most RELAY_MAX_PER_HOUR deliveries per
+ * hour per (topic, sending bot) within this bridge. Past it the post is logged
+ * as skipped and one stderr line is written.
+ *
+ * Amendment D. MONTY'S POST RESETS THE BOUND. When the bridge delivers a post
+ * of Monty's in a topic, every count for that topic is cleared: he is in the
+ * exchange, so it is not a loop. Any post of his counts, question or not.
+ * Another topic's counts are untouched, and so is the tag relay's own limiter.
+ *
+ * /halt AND /stop. A post of Monty's whose whole text is `/halt` or `/stop`
+ * (any case, with or without an `@<bot>` suffix) does not reset the bound. It
+ * suspends delivery from the log in that topic until his next post there that
+ * is neither, which lifts the suspension and resets the bound. A peer's post
+ * made while the topic is suspended is logged skipped:"halt" and is not
+ * delivered later. The suspension is kept in the state file with the seen
+ * keys, so a restart does not lift it. From anyone but Monty it is plain text.
  */
 
 import { readFileSync, renameSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
-import { requireMentionFor, type GroupPolicy } from './group-gate.ts'
+import { requireMentionFor, threadKey, type GroupPolicy } from './group-gate.ts'
+import { fromMonty } from './inbound-gate.ts'
 import { safeTee, type Tee } from './post-log.ts'
-import { RELAY_MAX_PER_HOUR, type RelayLimiter } from './tag-relay.ts'
+import { RELAY_MAX_PER_HOUR } from './tag-relay.ts'
 import type { OutputRunner } from './invite-excuse.ts'
 
 /** Half the 10s the spec allows from a peer's post to its delivery; the other half is the read. */
@@ -70,6 +84,39 @@ export function postKey(chat_id: string | number, message_id: number): string {
   return `${chat_id}:${message_id}`
 }
 
+/** One topic of one chat; a post with no thread id is the chat's General topic. */
+export function topicKey(chat_id: string | number, thread_id: number | undefined): string {
+  return `${chat_id}:${threadKey(thread_id)}`
+}
+
+const HOUR_MS = 60 * 60 * 1000
+
+/**
+ * At most `max` deliveries per (topic, sending bot) in any rolling hour,
+ * within this bridge. reset() clears one topic's counts and no other's.
+ */
+export class PeerLimiter {
+  private sent = new Map<string, Map<string, number[]>>()
+  constructor(private max = RELAY_MAX_PER_HOUR, private now: () => number = Date.now) {}
+
+  take(chat_id: string | number, thread_id: number | undefined, bot: string): boolean {
+    const topic = topicKey(chat_id, thread_id)
+    const bots = this.sent.get(topic) ?? new Map<string, number[]>()
+    this.sent.set(topic, bots)
+    const sender = bot.toLowerCase()
+    const cutoff = this.now() - HOUR_MS
+    const recent = (bots.get(sender) ?? []).filter(t => t > cutoff)
+    bots.set(sender, recent)
+    if (recent.length >= this.max) return false
+    recent.push(this.now())
+    return true
+  }
+
+  reset(chat_id: string | number, thread_id: number | undefined): void {
+    this.sent.delete(topicKey(chat_id, thread_id))
+  }
+}
+
 type SeenFs = { readFileSync: typeof readFileSync; writeFileSync: typeof writeFileSync; renameSync: typeof renameSync }
 
 /**
@@ -79,6 +126,7 @@ type SeenFs = { readFileSync: typeof readFileSync; writeFileSync: typeof writeFi
  */
 export class SeenPosts {
   private seen = new Map<string, number>()
+  private halts = new Set<string>()
   cursor: number
 
   constructor(
@@ -90,12 +138,13 @@ export class SeenPosts {
     this.cursor = now()
     if (!file) return
     try {
-      const state = JSON.parse(fs.readFileSync(file, 'utf8')) as { cursor?: string; seen?: Record<string, number> }
+      const state = JSON.parse(fs.readFileSync(file, 'utf8')) as { cursor?: string; seen?: Record<string, number>; halted?: string[] }
       const cursor = Date.parse(state.cursor ?? '')
       if (Number.isFinite(cursor)) this.cursor = cursor
       for (const [k, t] of Object.entries(state.seen ?? {})) {
         if (typeof t === 'number') this.seen.set(k, t)
       }
+      for (const k of state.halted ?? []) if (typeof k === 'string') this.halts.add(k)
     } catch (err) {
       // No file is a first start. Anything else is said, and starts fresh.
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -116,13 +165,28 @@ export class SeenPosts {
     return true
   }
 
+  /** Is delivery from the log suspended in this topic (a topicKey)? */
+  halted(topic: string): boolean {
+    return this.halts.has(topic)
+  }
+
+  halt(topic: string): void {
+    if (this.halts.has(topic)) return
+    this.halts.add(topic)
+    this.save()
+  }
+
+  lift(topic: string): void {
+    if (this.halts.delete(topic)) this.save()
+  }
+
   save(): void {
     const cutoff = this.now() - PEER_SEEN_KEEP_MS
     for (const [k, t] of this.seen) if (t < cutoff) this.seen.delete(k)
     if (!this.file) return
     try {
       const tmp = `${this.file}.tmp`
-      this.fs.writeFileSync(tmp, JSON.stringify({ cursor: new Date(this.cursor).toISOString(), seen: Object.fromEntries(this.seen) }) + '\n', { mode: 0o600 })
+      this.fs.writeFileSync(tmp, JSON.stringify({ cursor: new Date(this.cursor).toISOString(), seen: Object.fromEntries(this.seen), halted: [...this.halts] }) + '\n', { mode: 0o600 })
       this.fs.renameSync(tmp, this.file)
     } catch (err) {
       this.stderr(`telegram channel: peer post state not saved: ${err}\n`)
@@ -140,7 +204,7 @@ export type PeerDeps = {
   /** access.json's groups, as the gate reads them, re-read on every round. */
   groups: () => Record<string, GroupPolicy>
   seen: SeenPosts
-  limiter: RelayLimiter
+  limiter: PeerLimiter
   notify: (event: PeerEvent) => void
   tee?: Tee
   run: OutputRunner
@@ -149,7 +213,7 @@ export type PeerDeps = {
   bin?: string
 }
 
-export type PeerOutcome = { key: string; bot: string; delivered: boolean; skipped?: 'rate' }
+export type PeerOutcome = { key: string; bot: string; delivered: boolean; skipped?: 'rate' | 'halt' }
 
 /**
  * Deliver the peers' posts among `records`, each at most once. Returns one
@@ -178,7 +242,9 @@ export function deliverPeerPosts(deps: PeerDeps, records: PeerRecord[]): PeerOut
     const key = postKey(chat_id, r.message_id)
     if (!deps.seen.take(key)) continue
     const text = r.text ?? ''
-    const delivered = deps.limiter.take(bot, deps.ownBot())
+    // A suspended topic delivers nothing and spends none of the bound.
+    const halted = deps.seen.halted(topicKey(chat_id, thread_id))
+    const delivered = !halted && deps.limiter.take(chat_id, thread_id, bot)
     safeTee(deps.tee, {
       ts: new Date(now()).toISOString(),
       dir: 'in',
@@ -192,8 +258,12 @@ export function deliverPeerPosts(deps: PeerDeps, records: PeerRecord[]): PeerOut
       text,
       delivered,
       via: 'post-log',
-      ...(delivered ? {} : { skipped: 'rate' }),
+      ...(delivered ? {} : { skipped: halted ? 'halt' : 'rate' }),
     })
+    if (halted) {
+      out.push({ key, bot, delivered: false, skipped: 'halt' })
+      continue
+    }
     if (!delivered) {
       stderr(`telegram channel: peer post ${bot} -> ${deps.ownBot()} skipped: over ${RELAY_MAX_PER_HOUR} deliveries in the last hour (${key})\n`)
       out.push({ key, bot, delivered: false, skipped: 'rate' })
@@ -213,6 +283,47 @@ export function deliverPeerPosts(deps: PeerDeps, records: PeerRecord[]): PeerOut
     out.push({ key, bot, delivered: true })
   }
   return out
+}
+
+/** `/halt`, `/stop`, `/HALT@MK_GradyBot`: the whole text, nothing after it. */
+export function isHalt(text: string | undefined): boolean {
+  return /^\/(halt|stop)(@[A-Za-z0-9_]+)?$/i.test((text ?? '').trim())
+}
+
+export type MontyPost = {
+  chat_id: string | number
+  chat_type?: string
+  thread_id?: number
+  from: { id: number; is_bot?: boolean } | undefined
+  /** The message's text; a caption is never a command. */
+  text?: string
+}
+
+export type MontyDeps = {
+  seen: SeenPosts
+  limiter: PeerLimiter
+  /** The bridge's top-level allowFrom. */
+  allowFrom: () => string[]
+}
+
+/**
+ * Called for each post the bridge delivers. A group post of Monty's that is
+ * /halt or /stop suspends the topic it is in and returns 'halt'; any other
+ * lifts a suspension there, clears the topic's peer counts, and returns
+ * 'reset'. A post from anyone else, a bot wearing his id included, changes
+ * nothing.
+ */
+export function montyPosted(deps: MontyDeps, post: MontyPost): 'halt' | 'reset' | undefined {
+  if (post.chat_type !== 'group' && post.chat_type !== 'supergroup') return undefined
+  if (!fromMonty(deps.allowFrom(), post.from)) return undefined
+  const topic = topicKey(post.chat_id, post.thread_id)
+  if (isHalt(post.text)) {
+    deps.seen.halt(topic)
+    return 'halt'
+  }
+  deps.seen.lift(topic)
+  deps.limiter.reset(post.chat_id, post.thread_id)
+  return 'reset'
 }
 
 /** The JSON lines of `tail-fleet-posts --json`; a line that is not a record is passed over. */

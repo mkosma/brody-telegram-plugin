@@ -1436,6 +1436,7 @@ test('presence D6: who-hears and the gate agree on who is present', () => {
 
 import { homedir } from 'os'
 import { RELAY_MAX_PER_HOUR } from './tag-relay.ts'
+import { PeerLimiter, montyPosted, topicKey, isHalt, type MontyDeps } from './peer-posts.ts'
 import { SeenPosts, deliverPeerPosts, pollPeerPosts, postKey, PEER_POLL_MS, PEER_READ_TIMEOUT_MS, PEER_LOOKBACK_MS, PEER_OVERLAP_MS, PEER_READ_MAX_CHARS, TAIL_FLEET_POSTS_BIN, type PeerDeps, type PeerEvent, type PeerRecord } from './peer-posts.ts'
 
 const T0 = Date.parse('2026-11-20T08:00:00Z')
@@ -1455,7 +1456,7 @@ function peerRig(opts: { own?: string; file?: string; clock?: { t: number } } = 
     ownBot: () => opts.own ?? 'MK_GradyBot',
     groups: () => presence().groups,
     seen: new SeenPosts(opts.file, now, undefined, l => lines.push(l)),
-    limiter: new RelayLimiter(RELAY_MAX_PER_HOUR, now),
+    limiter: new PeerLimiter(RELAY_MAX_PER_HOUR, now),
     notify: e => events.push(e),
     tee: e => logged.push(e),
     run: async (argv, timeoutMs) => {
@@ -1836,4 +1837,280 @@ test('stamp S6: junk keys are dropped, long values cut, at most 8 keys kept, and
   // Through the command as well as the parser.
   const g = ctxRig(ctxStub(`printf 'track=A "B" <C>\\nBAD KEY=1\\n'`))
   expect(await inboundContext(g.deps, montyPost)).toEqual({ ctx_track: "A 'B' _C_" })
+})
+
+// ---------------------------------------------------------------------------
+// SPEC-bridge-presence-by-invite-2026-11-19, amendment D: the peer cap is per
+// topic and a post of Monty's in the topic resets it. Drills D13, D14.
+// "Monty" is a non-bot sender in the top-level allowFrom, never an id.
+// ---------------------------------------------------------------------------
+
+/** Message ids for capRig's peer posts: never reused, so a rig on a shared state file sees new posts. */
+let capPostId = 2000
+
+/** A second invited topic beside 40, so two topics can be told apart. */
+function capRig(opts: { file?: string } = {}) {
+  const g = peerRig(opts)
+  g.deps.groups = () => {
+    const a = presence()
+    a.groups[GROUP].threads!['41'] = { requireMention: false }
+    return a.groups
+  }
+  const monty: MontyDeps = { seen: g.deps.seen, limiter: g.deps.limiter, allowFrom: () => [String(MONTY)] }
+  /** One peer post in a topic: was it delivered? */
+  const peer = (thread: number | null, bot = 'MK_MayaBot') => deliverPeerPosts(g.deps, [peerOut(bot, ++capPostId, thread)])[0]?.delivered
+  const says = (thread: number | undefined, from: { id: number; is_bot?: boolean } | null = { id: MONTY }, chat_type = 'supergroup', text: string | undefined = 'carry on') =>
+    montyPosted(monty, { chat_id: GROUP, chat_type, thread_id: thread, from: from ?? undefined, text })
+  /** Monty posts `text` in a topic. */
+  const posts = (text: string | undefined, thread: number | undefined = 40, from: { id: number; is_bot?: boolean } = { id: MONTY }) => says(thread, from, 'supergroup', text)
+  return { ...g, peer, says, posts }
+}
+
+test('cap reset D13: after 6 deliveries from one peer in a topic, a Monty post there lets the 7th through', () => {
+  const g = capRig()
+  for (let i = 0; i < 6; i++) expect(g.peer(40)).toBe(true)
+  expect(g.says(40)).toBe('reset')
+  expect(g.peer(40)).toBe(true)
+  // The count starts again from nothing: six more, then the bound holds until he posts again.
+  for (let i = 0; i < 5; i++) expect(g.peer(40)).toBe(true)
+  expect(g.peer(40)).toBe(false)
+  expect(g.peer(40)).toBe(false)
+  expect(g.says(40)).toBe('reset')
+  expect(g.peer(40)).toBe(true)
+  // Every peer's count in the topic is cleared, not one peer's.
+  const two = capRig()
+  for (let i = 0; i < 6; i++) { two.peer(40); two.peer(40, 'MK_WernerBot') }
+  expect([two.peer(40), two.peer(40, 'MK_WernerBot')]).toEqual([false, false])
+  two.says(40)
+  expect([two.peer(40), two.peer(40, 'MK_WernerBot')]).toEqual([true, true])
+})
+
+test('cap reset D13: only Monty resets: not a peer bot, a stranger, a bot wearing his id, or a DM', () => {
+  const g = capRig()
+  for (let i = 0; i < 6; i++) g.peer(40)
+  for (const from of [{ id: 333, is_bot: true }, { id: 222 }, { id: MONTY, is_bot: true }, null]) {
+    expect(g.says(40, from)).toBeUndefined()
+    expect(g.peer(40)).toBe(false)
+  }
+  expect(g.says(40, { id: MONTY }, 'private')).toBeUndefined()
+  expect(g.peer(40)).toBe(false)
+  expect(g.says(40, { id: MONTY, is_bot: false })).toBe('reset')
+  expect(g.peer(40)).toBe(true)
+})
+
+test('cap reset D13: the server resets on a post it delivers, with its own access list and the peer limiter', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  expect(src).toContain('const peerLimiter = new PeerLimiter()\n')
+  expect(src).toContain('const montyDeps: MontyDeps = {\n  seen: peerSeen,\n  limiter: peerLimiter,\n  allowFrom: () => loadAccess().allowFrom,\n')
+  expect(src).toContain('  seen: peerSeen,\n  limiter: peerLimiter,\n  tee,\n')
+  const start = src.indexOf('async function handleInbound(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const gateAt = body.indexOf('const result = teeInbound(teeArgs, () => gate(ctx))')
+  const dropped = body.indexOf("if (result.action === 'drop') return")
+  const reset = body.indexOf('montyPosted(montyDeps, { chat_id, chat_type: ctx.chat!.type, thread_id: threadId, from')
+  const deliver = body.indexOf("method: 'notifications/claude/channel',", reset)
+  expect(gateAt).toBeGreaterThan(-1)
+  expect(dropped).toBeGreaterThan(gateAt)
+  expect(reset).toBeGreaterThan(dropped)
+  expect(deliver).toBeGreaterThan(reset)
+  // The tag relay keeps its own limiter, per (sender, recipient), untouched.
+  expect(src).toContain('const relayLimiter = new RelayLimiter()\n')
+})
+
+test('cap reset D14: the cap is per topic, and a Monty post in topic A does not reset topic B', () => {
+  const g = capRig()
+  // Six in topic 40 leave topic 41 and General-keyed counts untouched.
+  for (let i = 0; i < 6; i++) expect(g.peer(40)).toBe(true)
+  expect(g.peer(40)).toBe(false)
+  for (let i = 0; i < 6; i++) expect(g.peer(41)).toBe(true)
+  expect(g.peer(41)).toBe(false)
+  // He posts in 41: 41 opens, 40 stays at its bound.
+  expect(g.says(41)).toBe('reset')
+  expect(g.peer(41)).toBe(true)
+  expect(g.peer(40)).toBe(false)
+  // And the other way, and General is its own topic.
+  expect(g.says(undefined)).toBe('reset')
+  expect(g.peer(40)).toBe(false)
+  expect(g.says(40)).toBe('reset')
+  expect(g.peer(40)).toBe(true)
+  expect(topicKey(GROUP, undefined)).toBe(`${GROUP}:general`)
+  expect(topicKey(Number(GROUP), 40)).toBe(topicKey(GROUP, 40))
+  // Another chat's topic 40 is another topic.
+  const lim = new PeerLimiter(1, () => T0)
+  expect(lim.take(GROUP, 40, 'MK_MayaBot')).toBe(true)
+  expect(lim.take(GROUP, 40, 'mk_mayabot')).toBe(false)
+  lim.reset('-100999', 40)
+  expect(lim.take(GROUP, 40, 'MK_MayaBot')).toBe(false)
+})
+
+// ---------------------------------------------------------------------------
+// Amendment D, answered by Monty: /halt and /stop suspend peer posts in a
+// topic until his next post there. Drills D19-D22.
+// ---------------------------------------------------------------------------
+
+test("halt D19: after Monty's /halt a peer's post in that topic is not delivered, and his next post lifts it", () => {
+  const g = capRig()
+  for (let i = 0; i < 6; i++) expect(g.peer(40)).toBe(true)
+  expect(g.posts('/halt')).toBe('halt')
+  // It suspends; it does not reset: the six still count.
+  expect(g.deps.seen.halted(topicKey(GROUP, 40))).toBe(true)
+  const held = peerOut('MK_WernerBot', 3001, 40, 'and another thing')
+  expect(deliverPeerPosts(g.deps, [held])).toEqual([{ key: `${GROUP}:3001`, bot: 'MK_WernerBot', delivered: false, skipped: 'halt' }])
+  expect(g.peer(40)).toBe(false)
+  expect(g.events.length).toBe(6)
+  // On the bridge's own record as skipped, with no stderr line: a halt is not a fault.
+  expect(g.logged[6]).toEqual(expect.objectContaining({ message_id: 3001, delivered: false, skipped: 'halt', via: 'post-log' }))
+  expect(g.lines).toEqual([])
+  // The topic, not the bridge: 41 still hears its peers.
+  expect(g.peer(41)).toBe(true)
+  // A second /halt changes nothing, and a suspended post spent none of the bound.
+  expect(g.posts('/halt')).toBe('halt')
+  expect(g.peer(40)).toBe(false)
+  // His next post there lifts it and resets the cap; one in another topic does not.
+  expect(g.posts('ok, carry on', 41)).toBe('reset')
+  expect(g.peer(40)).toBe(false)
+  expect(g.posts('ok, carry on')).toBe('reset')
+  expect(g.deps.seen.halted(topicKey(GROUP, 40))).toBe(false)
+  for (let i = 0; i < 6; i++) expect(g.peer(40)).toBe(true)
+  expect(g.peer(40)).toBe(false)
+  // What a peer said while the topic was suspended is not delivered afterwards.
+  g.posts('go on')
+  expect(deliverPeerPosts(g.deps, [held])).toEqual([])
+  expect(g.events.map(e => e.meta.message_id)).not.toContain('3001')
+})
+
+test('halt D19: the server hands the post to the agent with command="halt" and tells it to stop', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('async function handleInbound(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const dropped = body.indexOf("if (result.action === 'drop') return")
+  const posted = body.indexOf('  const posted = montyPosted(montyDeps, { chat_id, chat_type: ctx.chat!.type, thread_id: threadId, from, text: ctx.message?.text })\n')
+  const meta = body.indexOf("        ...(posted === 'halt' ? { command: 'halt' } : {}),\n")
+  expect(posted).toBeGreaterThan(dropped)
+  expect(meta).toBeGreaterThan(posted)
+  expect(src).toContain('arrives as an ordinary message with command="halt". Stop the exchange: post nothing further in that topic until Monty posts there again.')
+})
+
+test('halt D20: /stop behaves as /halt, in any case and with a bot suffix; anything more is an ordinary post', () => {
+  for (const text of ['/stop', '/STOP', '/Halt', '/halt@MK_GradyBot', '/stop@mk_verabot', '  /stop\n']) {
+    const g = capRig()
+    expect(isHalt(text)).toBe(true)
+    expect(g.posts(text)).toBe('halt')
+    expect(g.peer(40)).toBe(false)
+    expect(g.posts('go on')).toBe('reset')
+    expect(g.peer(40)).toBe(true)
+  }
+  for (const text of ['/halt now', 'halt', 'stop', '/halting', '/stopx', 'please /stop', '/halt @grady', '/stop@', undefined]) {
+    const g = capRig()
+    expect(isHalt(text)).toBe(false)
+    expect(g.posts(text)).toBe('reset')
+    expect(g.peer(40)).toBe(true)
+  }
+})
+
+test('halt D21: the suspension survives a restart, and so does its lifting', () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'peer-halt-')), 'peer-posts.json')
+  const g = capRig({ file })
+  expect(g.posts('/halt')).toBe('halt')
+  expect(JSON.parse(readFileSync(file, 'utf8')).halted).toEqual([topicKey(GROUP, 40)])
+  // A new bridge on the same state file: still suspended, in that topic only.
+  const again = capRig({ file })
+  expect(again.deps.seen.halted(topicKey(GROUP, 40))).toBe(true)
+  expect(again.peer(40)).toBe(false)
+  expect(again.peer(41)).toBe(true)
+  expect(again.logged[0]).toEqual(expect.objectContaining({ delivered: false, skipped: 'halt' }))
+  // His next post lifts it, and the lift is on disk too.
+  expect(again.posts('carry on')).toBe('reset')
+  expect(JSON.parse(readFileSync(file, 'utf8')).halted).toEqual([])
+  const third = capRig({ file })
+  expect(third.peer(40)).toBe(true)
+  // One state file, the one the seen keys live in.
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  expect(src).toContain('const montyDeps: MontyDeps = {\n  seen: peerSeen,\n')
+})
+
+test("halt D22: a peer bot's /halt, or anyone else's, suspends nothing", () => {
+  for (const from of [{ id: 333, is_bot: true }, { id: 222 }, { id: MONTY, is_bot: true }]) {
+    const g = capRig()
+    expect(g.posts('/halt', 40, from)).toBeUndefined()
+    expect(g.posts('/stop', 40, from)).toBeUndefined()
+    expect(g.deps.seen.halted(topicKey(GROUP, 40))).toBe(false)
+    expect(g.peer(40)).toBe(true)
+  }
+  // And nobody but Monty lifts one.
+  const g = capRig()
+  g.posts('/halt')
+  expect(g.posts('carry on', 40, { id: 333, is_bot: true })).toBeUndefined()
+  expect(g.posts('carry on', 40, { id: 222 })).toBeUndefined()
+  expect(g.peer(40)).toBe(false)
+  // In a DM it is not a topic's command.
+  expect(g.says(undefined, { id: MONTY }, 'private', '/halt')).toBeUndefined()
+})
+
+// ---------------------------------------------------------------------------
+// Amendment D: Monty's @everyone tags every bot present in the topic.
+// Drills D15-D17 (D18, the wake, is in wake-check.test.ts).
+// ---------------------------------------------------------------------------
+import { everyoneTagged, fromMonty, EVERYONE_RE } from './inbound-gate.ts'
+
+/** One post in the presence() forum (40 invited, 333 excused, 77 never entered): is it tagged, and what does the gate do? */
+function everyonePost(text: string, thread: number | undefined, from: { id: number; is_bot?: boolean } = { id: MONTY }, message: Record<string, unknown> = { text }) {
+  const access = { dmPolicy: 'allowlist', ...presence() } as GateAccess
+  const p = { from, chat: FORUM as any, message: { ...message, ...(thread != null ? { message_thread_id: thread } : {}) } }
+  return { tagged: everyoneTagged(access, p), decision: inboundDecision(access, p, 'MK_GradyBot', 'Grady') }
+}
+
+test('everyone D15: Monty\'s @everyone in a present topic carries tagged="everyone"', () => {
+  for (const text of ['@everyone status?', 'ok @Everyone, thoughts', 'so, @EVERYONE.', 'where are we\n@everyone']) {
+    expect(everyonePost(text, 40)).toEqual({ tagged: true, decision: 'deliver' })
+  }
+  // On a photo it is the caption that says it.
+  expect(everyonePost('', 40, { id: MONTY }, { caption: 'look @everyone' }).tagged).toBe(true)
+  // A whole word: not part of an address, a longer name, or a word without the @.
+  for (const text of ['mail x@everyone.com', '@everyone2', '@everyoneelse', 'everyone, hello', '@@everyone', 'no tag here']) {
+    expect(everyonePost(text, 40)).toEqual({ tagged: false, decision: 'deliver' })
+  }
+  expect(EVERYONE_RE.test('@everyone')).toBe(true)
+  // The server puts it on the event it delivers, from the access the gate just read.
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('async function handleInbound(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const dropped = body.indexOf("if (result.action === 'drop') return")
+  const tag = body.indexOf('  const everyone = everyoneTagged(access, { from, chat: ctx.chat, message: ctx.message })\n')
+  const meta = body.indexOf("        ...(everyone ? { tagged: 'everyone' } : {}),\n")
+  expect(tag).toBeGreaterThan(dropped)
+  expect(meta).toBeGreaterThan(tag)
+  expect(src).toContain('tagged="everyone" is one where he wrote @everyone in a topic you are present in. Treat it as a tag to you: under the fleet response rules each tagged bot owes him an answer.')
+})
+
+test('everyone D16: in an absent topic @everyone delivers nothing and writes no thread entry', async () => {
+  // Never entered, excused, and General with no entry: no tag, and the gate drops it.
+  for (const thread of [77, 333, undefined]) {
+    expect(everyonePost('@everyone status?', thread)).toEqual({ tagged: false, decision: 'drop' })
+  }
+  // It is no mention, so it is no invite: nothing is written, said or told.
+  const g = mentionRig()
+  expect(await g.post({ text: '@everyone status?' }, 77)).toEqual({ plan: undefined, decision: 'drop' })
+  expect(await g.post({ text: '@everyone come back' }, 333)).toEqual({ plan: undefined, decision: 'drop' })
+  expect(g.saves).toEqual([])
+  expect(g.access()).toEqual(presence())
+  expect(g.answers).toEqual([])
+  expect(g.events).toEqual([])
+  expect(isMentioned({ text: '@everyone status?' }, 'MK_GradyBot', undefined, 'Grady')).toBe(false)
+  // A group the bridge has no entry for, and a DM, are no topic at all.
+  const access = { dmPolicy: 'allowlist', ...presence() } as GateAccess
+  expect(everyoneTagged(access, { from: { id: MONTY }, chat: { id: -100999, type: 'supergroup', is_forum: true }, message: { text: '@everyone', message_thread_id: 40 } })).toBe(false)
+  expect(everyoneTagged(access, { from: { id: MONTY }, chat: { id: MONTY, type: 'private' }, message: { text: '@everyone' } })).toBe(false)
+})
+
+test("everyone D17: a peer bot's @everyone, or anyone else's, carries no tag", () => {
+  // A peer bot, a person outside allowFrom, and a bot wearing Monty's id: delivered in a present topic, as plain text.
+  for (const from of [{ id: 333, is_bot: true }, { id: 222 }, { id: MONTY, is_bot: true }]) {
+    expect(everyonePost('@everyone status?', 40, from)).toEqual({ tagged: false, decision: 'deliver' })
+  }
+  expect(everyoneTagged({ allowFrom: [String(MONTY)], groups: presence().groups }, { from: undefined, chat: FORUM, message: { text: '@everyone', message_thread_id: 40 } })).toBe(false)
+  // Monty is whoever the top-level allowFrom names, not an id in the code.
+  expect(fromMonty(['222'], { id: 222 })).toBe(true)
+  expect(fromMonty(['222'], { id: MONTY })).toBe(false)
+  expect(everyoneTagged({ allowFrom: ['222'], groups: presence().groups }, { from: { id: 222 }, chat: FORUM, message: { text: '@everyone', message_thread_id: 40 } })).toBe(true)
 })
