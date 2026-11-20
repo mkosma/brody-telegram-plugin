@@ -30,6 +30,16 @@ export type GateAccess = {
 export type InboundDecision = 'deliver' | 'drop' | 'pair'
 
 /**
+ * Monty: a sender who is not a bot and is in the bridge's top-level
+ * `allowFrom`. The authority /invite and the context stamp use; no id is
+ * written anywhere.
+ */
+export function fromMonty(allowFrom: string[], from: { id: number; is_bot?: boolean } | undefined): boolean {
+  if (!from || from.is_bot) return false
+  return allowFrom.includes(String(from.id))
+}
+
+/**
  * gate()'s decision, without its side effects. 'pair' means a DM from a
  * stranger under dmPolicy "pairing": gate() then issues or re-sends a code, or
  * drops it when the pending cap is reached. Nothing is delivered to the

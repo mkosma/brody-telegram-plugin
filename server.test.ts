@@ -1436,6 +1436,7 @@ test('presence D6: who-hears and the gate agree on who is present', () => {
 
 import { homedir } from 'os'
 import { RELAY_MAX_PER_HOUR } from './tag-relay.ts'
+import { PeerLimiter, montyPosted, topicKey, type MontyDeps } from './peer-posts.ts'
 import { SeenPosts, deliverPeerPosts, pollPeerPosts, postKey, PEER_POLL_MS, PEER_READ_TIMEOUT_MS, PEER_LOOKBACK_MS, PEER_OVERLAP_MS, PEER_READ_MAX_CHARS, TAIL_FLEET_POSTS_BIN, type PeerDeps, type PeerEvent, type PeerRecord } from './peer-posts.ts'
 
 const T0 = Date.parse('2026-11-20T08:00:00Z')
@@ -1455,7 +1456,7 @@ function peerRig(opts: { own?: string; file?: string; clock?: { t: number } } = 
     ownBot: () => opts.own ?? 'MK_GradyBot',
     groups: () => presence().groups,
     seen: new SeenPosts(opts.file, now, undefined, l => lines.push(l)),
-    limiter: new RelayLimiter(RELAY_MAX_PER_HOUR, now),
+    limiter: new PeerLimiter(RELAY_MAX_PER_HOUR, now),
     notify: e => events.push(e),
     tee: e => logged.push(e),
     run: async (argv, timeoutMs) => {
@@ -1836,4 +1837,104 @@ test('stamp S6: junk keys are dropped, long values cut, at most 8 keys kept, and
   // Through the command as well as the parser.
   const g = ctxRig(ctxStub(`printf 'track=A "B" <C>\\nBAD KEY=1\\n'`))
   expect(await inboundContext(g.deps, montyPost)).toEqual({ ctx_track: "A 'B' _C_" })
+})
+
+// ---------------------------------------------------------------------------
+// SPEC-bridge-presence-by-invite-2026-11-19, amendment D: the peer cap is per
+// topic and a post of Monty's in the topic resets it. Drills D13, D14.
+// "Monty" is a non-bot sender in the top-level allowFrom, never an id.
+// ---------------------------------------------------------------------------
+
+/** A second invited topic beside 40, so two topics can be told apart. */
+function capRig() {
+  const g = peerRig()
+  g.deps.groups = () => {
+    const a = presence()
+    a.groups[GROUP].threads!['41'] = { requireMention: false }
+    return a.groups
+  }
+  const monty: MontyDeps = { limiter: g.deps.limiter, allowFrom: () => [String(MONTY)] }
+  let id = 2000
+  /** One peer post in a topic: was it delivered? */
+  const peer = (thread: number | null, bot = 'MK_MayaBot') => deliverPeerPosts(g.deps, [peerOut(bot, ++id, thread)])[0]?.delivered
+  const says = (thread: number | undefined, from: { id: number; is_bot?: boolean } | null = { id: MONTY }, chat_type = 'supergroup') =>
+    montyPosted(monty, { chat_id: GROUP, chat_type, thread_id: thread, from: from ?? undefined })
+  return { ...g, peer, says }
+}
+
+test('cap reset D13: after 6 deliveries from one peer in a topic, a Monty post there lets the 7th through', () => {
+  const g = capRig()
+  for (let i = 0; i < 6; i++) expect(g.peer(40)).toBe(true)
+  expect(g.says(40)).toBe('reset')
+  expect(g.peer(40)).toBe(true)
+  // The count starts again from nothing: six more, then the bound holds until he posts again.
+  for (let i = 0; i < 5; i++) expect(g.peer(40)).toBe(true)
+  expect(g.peer(40)).toBe(false)
+  expect(g.peer(40)).toBe(false)
+  expect(g.says(40)).toBe('reset')
+  expect(g.peer(40)).toBe(true)
+  // Every peer's count in the topic is cleared, not one peer's.
+  const two = capRig()
+  for (let i = 0; i < 6; i++) { two.peer(40); two.peer(40, 'MK_WernerBot') }
+  expect([two.peer(40), two.peer(40, 'MK_WernerBot')]).toEqual([false, false])
+  two.says(40)
+  expect([two.peer(40), two.peer(40, 'MK_WernerBot')]).toEqual([true, true])
+})
+
+test('cap reset D13: only Monty resets: not a peer bot, a stranger, a bot wearing his id, or a DM', () => {
+  const g = capRig()
+  for (let i = 0; i < 6; i++) g.peer(40)
+  for (const from of [{ id: 333, is_bot: true }, { id: 222 }, { id: MONTY, is_bot: true }, null]) {
+    expect(g.says(40, from)).toBeUndefined()
+    expect(g.peer(40)).toBe(false)
+  }
+  expect(g.says(40, { id: MONTY }, 'private')).toBeUndefined()
+  expect(g.peer(40)).toBe(false)
+  expect(g.says(40, { id: MONTY, is_bot: false })).toBe('reset')
+  expect(g.peer(40)).toBe(true)
+})
+
+test('cap reset D13: the server resets on a post it delivers, with its own access list and the peer limiter', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  expect(src).toContain('const peerLimiter = new PeerLimiter()\n')
+  expect(src).toContain('const montyDeps: MontyDeps = {\n  limiter: peerLimiter,\n  allowFrom: () => loadAccess().allowFrom,\n')
+  expect(src).toContain('  seen: peerSeen,\n  limiter: peerLimiter,\n')
+  const start = src.indexOf('async function handleInbound(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const gateAt = body.indexOf('const result = teeInbound(teeArgs, () => gate(ctx))')
+  const dropped = body.indexOf("if (result.action === 'drop') return")
+  const reset = body.indexOf('montyPosted(montyDeps, { chat_id, chat_type: ctx.chat!.type, thread_id: threadId, from')
+  const deliver = body.indexOf("method: 'notifications/claude/channel',", reset)
+  expect(gateAt).toBeGreaterThan(-1)
+  expect(dropped).toBeGreaterThan(gateAt)
+  expect(reset).toBeGreaterThan(dropped)
+  expect(deliver).toBeGreaterThan(reset)
+  // The tag relay keeps its own limiter, per (sender, recipient), untouched.
+  expect(src).toContain('const relayLimiter = new RelayLimiter()\n')
+})
+
+test('cap reset D14: the cap is per topic, and a Monty post in topic A does not reset topic B', () => {
+  const g = capRig()
+  // Six in topic 40 leave topic 41 and General-keyed counts untouched.
+  for (let i = 0; i < 6; i++) expect(g.peer(40)).toBe(true)
+  expect(g.peer(40)).toBe(false)
+  for (let i = 0; i < 6; i++) expect(g.peer(41)).toBe(true)
+  expect(g.peer(41)).toBe(false)
+  // He posts in 41: 41 opens, 40 stays at its bound.
+  expect(g.says(41)).toBe('reset')
+  expect(g.peer(41)).toBe(true)
+  expect(g.peer(40)).toBe(false)
+  // And the other way, and General is its own topic.
+  expect(g.says(undefined)).toBe('reset')
+  expect(g.peer(40)).toBe(false)
+  expect(g.says(40)).toBe('reset')
+  expect(g.peer(40)).toBe(true)
+  expect(topicKey(GROUP, undefined)).toBe(`${GROUP}:general`)
+  expect(topicKey(Number(GROUP), 40)).toBe(topicKey(GROUP, 40))
+  // Another chat's topic 40 is another topic.
+  const lim = new PeerLimiter(1, () => T0)
+  expect(lim.take(GROUP, 40, 'MK_MayaBot')).toBe(true)
+  expect(lim.take(GROUP, 40, 'mk_mayabot')).toBe(false)
+  lim.reset('-100999', 40)
+  expect(lim.take(GROUP, 40, 'MK_MayaBot')).toBe(false)
 })

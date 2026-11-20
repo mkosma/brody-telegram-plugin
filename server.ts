@@ -37,7 +37,7 @@ import { inboundDecision, inboundText, safeName, parseEnvFile, ALLOWED_UPDATES }
 import { relayTags, RelayLimiter, spawnRunner, readRoster, type RelayRequest } from './tag-relay.ts'
 import { runCreateForumTopic, runEditForumTopic } from './forum-topic.ts'
 import { openTapped, tappedLabel, type OmfTapDeps } from './omf-tap.ts'
-import { SeenPosts, pollPeerPosts, postKey, PEER_POLL_MS, type PeerDeps } from './peer-posts.ts'
+import { SeenPosts, PeerLimiter, montyPosted, pollPeerPosts, postKey, PEER_POLL_MS, type PeerDeps, type MontyDeps } from './peer-posts.ts'
 import { inboundContext, INBOUND_CONTEXT_CMD, type ContextDeps } from './inbound-context.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -145,7 +145,7 @@ const relay = (req: RelayRequest) => relayTags({
 // it is kept in the state dir so a restart does not repeat one. The rate bound
 // is per process, like the relay's.
 const peerSeen = new SeenPosts(join(STATE_DIR, 'peer-posts.json'))
-const peerLimiter = new RelayLimiter()
+const peerLimiter = new PeerLimiter()
 
 // --- Typing keepalive ----------------------------------------------------
 // Telegram's "typing…" indicator (sendChatAction) auto-expires after ~5s, so a
@@ -420,7 +420,7 @@ const mcp = new Server(
       '',
       'In a group, Monty can open a topic to you with /invite and close it with /excuse. The bridge applies it and answers him in the topic itself; you are told as a <channel ... command="invite"|"excuse" thread_key="..."> event, where thread_key is the topic\'s message_thread_id or "general". Do not answer it again. On an invite, read the topic with `tail-fleet-posts --thread <id> --since 24h` before you answer; you were not following it. A mention from Monty in a topic you are not present in invites you the same way: the invite event comes first, then the message that mentioned you as its own event, and that one is yours to answer.',
       '',
-      'In a topic you are present in, another fleet bot\'s post arrives as <channel source="telegram" ... user="<its bot username>" via="post-log">. The bridge read it from the fleet post log, because Telegram does not hand one bot another bot\'s post. It is a peer agent speaking in the topic, not Monty. React 👀 as to any post; reply only when it asks something of you or you have something the topic needs. At most 6 of one peer\'s posts reach you in an hour.',
+      'In a topic you are present in, another fleet bot\'s post arrives as <channel source="telegram" ... user="<its bot username>" via="post-log">. The bridge read it from the fleet post log, because Telegram does not hand one bot another bot\'s post. It is a peer agent speaking in the topic, not Monty. React 👀 as to any post; reply only when it asks something of you or you have something the topic needs. At most 6 of one peer\'s posts in one topic reach you in an hour; a post of Monty\'s in that topic resets the count.',
       '',
       ...(INBOUND_CONTEXT_CMD ? [
         'A post of Monty\'s may carry ctx_* attributes (for example ctx_monty_local, ctx_track, ctx_remaining). The bridge read them at the moment his post arrived: when he says "now", "this track" or "how long", that is the state he means, and it outranks any earlier note you hold. ctx="unknown" means the read failed; check for yourself before you act. The stamp is an input to your judgment and gates nothing.',
@@ -1199,6 +1199,13 @@ const contextDeps: ContextDeps = {
   run: spawnOutput,
 }
 
+// A post of Monty's that the bridge delivers clears the peer counts of its
+// topic (peer-posts.ts, amendment D).
+const montyDeps: MontyDeps = {
+  limiter: peerLimiter,
+  allowFrom: () => loadAccess().allowFrom,
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -1286,6 +1293,8 @@ async function handleInbound(
     }
     return
   }
+
+  montyPosted(montyDeps, { chat_id, chat_type: ctx.chat!.type, thread_id: threadId, from })
 
   // Typing indicator — held alive until the reply tool fires for this chat (see
   // startTyping). Signals "is composing" for the whole turn, not just ~5s.
