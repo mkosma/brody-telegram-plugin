@@ -562,8 +562,13 @@ def copy_tree(dst):
 
 
 def run_tests(d):
-    p = subprocess.run(["bun", "test"], cwd=d, capture_output=True, text=True, timeout=120)
-    out = p.stdout + p.stderr
+    # Through a file, not a pipe: a failing wiring test prints all of server.ts,
+    # and once that passed the 64K pipe buffer bun's output arrived cut short,
+    # without the "(fail)" line that names the test.
+    with tempfile.TemporaryFile("w+") as f:
+        p = subprocess.run(["bun", "test"], cwd=d, stdout=f, stderr=subprocess.STDOUT, timeout=180)
+        f.seek(0)
+        out = f.read()
     return p.returncode, FAIL_RE.findall(out), out
 
 
