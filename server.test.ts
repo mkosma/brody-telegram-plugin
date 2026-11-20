@@ -247,6 +247,26 @@ test('thread gate: a reply to the bot in a gated thread still delivers', () => {
   expect(groupDecision(fleet, '111', m, BOT)).toBe('deliver')
 })
 
+test('thread gate: a post whose reply_to_message is the topic root is no mention, in a topic the bot created', () => {
+  const from = { username: BOT }
+  // A plain post in topic 39, which the bot created: the client files it as a reply to the root.
+  const byId = { text: 'yes', message_thread_id: 39, reply_to_message: { message_id: 39, from } }
+  const byService = { text: 'yes', message_thread_id: 39, reply_to_message: { message_id: 39, forum_topic_created: { name: 'Vera' }, from } }
+  const serviceOnly = { text: 'yes', message_thread_id: 39, reply_to_message: { forum_topic_created: { name: 'Vera' }, from } }
+  for (const m of [byId, byService, serviceOnly]) {
+    expect(isMentioned(m, BOT)).toBe(false)
+    expect(groupDecision(fleet, '111', m, BOT)).toBe('drop')
+  }
+  // An explicit mention in such a post still counts.
+  expect(groupDecision(fleet, '111', { ...byId, text: 'yes @MK_VeraBot', entities: [{ type: 'mention', offset: 4, length: 11 }] }, BOT)).toBe('deliver')
+})
+
+test("thread gate: a quote-reply to the bot's own post in a topic it created is still a mention", () => {
+  const m = { text: 'yes', message_thread_id: 39, reply_to_message: { message_id: 1204, from: { username: BOT } } }
+  expect(isMentioned(m, BOT)).toBe(true)
+  expect(groupDecision(fleet, '111', m, BOT)).toBe('deliver')
+})
+
 test('thread gate: a thread entry can also lift a group-wide requirement', () => {
   const p: GroupPolicy = { requireMention: true, allowFrom: [], threads: { '40': { requireMention: false } } }
   expect(requireMentionFor(p, 40)).toBe(false)
@@ -489,7 +509,7 @@ test("name mention: gate() passes the bridge's agent name to groupDecision", () 
   const body = src.slice(start, src.indexOf('\n}\n', start))
   expect(body).toContain('inboundDecision(access, ctx, botUsername, ACCESS_AGENT)')
   const shared = readFileSync(join(import.meta.dir, 'inbound-gate.ts'), 'utf8')
-  expect(shared).toMatch(/groupDecision\([^)]*access\.mentionPatterns, agent\)/)
+  expect(shared).toMatch(/groupDecision\([^)]*access\.mentionPatterns, agent, p\.chat!\.is_forum === true\)/)
 })
 
 // Item 1, relay half. Acceptance 2.
@@ -586,7 +606,7 @@ function commandRig(opts: { agent?: string; bot?: string; access?: CommandAccess
   // The same composition server.ts uses: plan synchronously, then run.
   // thread null is the General topic (no message_thread_id).
   const send = async (text: string, thread: number | null = THREAD, from: CommandMessage['from'] = { id: MONTY }) => {
-    const plan = planGroupCommand(deps, { chat_id: GROUP, chat_type: 'supergroup', from, text, ...(thread != null ? { message_thread_id: thread } : {}) })
+    const plan = planGroupCommand(deps, { chat_id: GROUP, chat_type: 'supergroup', is_forum: true, from, text, ...(thread != null ? { message_thread_id: thread } : {}) })
     if (plan.kind === 'act') return runGroupCommand(deps, plan)
     return plan.kind
   }
@@ -740,7 +760,7 @@ test('invite: handleInbound plans the command before gate() and never delivers i
 
 test('invite: the MCP instructions tell the agent to read the topic on an invite', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-  expect(src).toContain('On an invite, read the topic with `tail-fleet-posts --thread <id> --since 2h` before you answer; you were not following it.')
+  expect(src).toContain('On an invite, read the topic with `tail-fleet-posts --thread <id> --since 24h` before you answer; you were not following it.')
 })
 
 // Amendment (agents 16d16c3): the answer is a phrase from the agent's own list.
@@ -901,7 +921,7 @@ function fleetRig(access: () => CommandAccess = openIn40, whoRun?: OutputRunner)
   const send = async (text: string, thread: number | null = THREAD, from: CommandMessage['from'] = { id: MONTY }) => {
     const kinds: Record<string, string> = {}
     for (const b of bridges) {
-      const plan = planCmd(b.rig.deps, { chat_id: GROUP, chat_type: 'supergroup', from, text, ...(thread != null ? { message_thread_id: thread } : {}) })
+      const plan = planCmd(b.rig.deps, { chat_id: GROUP, chat_type: 'supergroup', is_forum: true, from, text, ...(thread != null ? { message_thread_id: thread } : {}) })
       kinds[b.agent] = plan.kind
       if (plan.kind === 'say') await sayGroupCommand(b.rig.deps, plan)
       if (plan.kind === 'who') await runWho({ run: b.run, answer: b.rig.deps.answer, stderr: () => {} }, plan)
@@ -1097,4 +1117,575 @@ test('all: the server runs who-hears through spawnOutput without awaiting it, an
   const block = body.slice(early, body.indexOf('gate(ctx)'))
   expect(block).toContain("if (command.kind === 'who') void runWho({ run: spawnOutput, answer: deps.answer }, command)")
   expect(block).toContain("if (command.kind === 'say') await sayGroupCommand(deps, command)")
+})
+
+// --- SPEC-bridge-presence-by-invite-2026-11-19 -----------------------------------
+// A bot is present in a forum topic only by /invite, and Monty's mention in a
+// topic it is absent from invites it. Drills D1-D4 and D6; D5 is in
+// wake-check.test.ts. Nothing here reaches Telegram or a session: the gate
+// and the plans are pure, and the rig's answer and notify are arrays.
+
+import { planMentionInvite, type MentionMessage } from './invite-excuse.ts'
+import { inboundDecision, type GateAccess } from './inbound-gate.ts'
+import { spawnSync } from 'child_process'
+
+const FORUM = { id: Number(GROUP), type: 'supergroup', is_forum: true }
+// Group level false, as Grady's and Vera's access.json have it: one invited
+// thread (40), one excused thread (333), and thread 77 never entered.
+const presence = (): CommandAccess & { mentionPatterns?: string[] } => ({
+  allowFrom: [String(MONTY)],
+  groups: { [GROUP]: { requireMention: false, allowFrom: [], threads: { '40': { requireMention: false }, '333': { requireMention: true } } } },
+})
+const forumGate = (access: CommandAccess, text: string, thread: number | undefined, from = MONTY, chat: object = FORUM) =>
+  inboundDecision({ dmPolicy: 'allowlist', ...access } as GateAccess, { from: { id: from }, chat: chat as any, message: { text, ...(thread != null ? { message_thread_id: thread } : {}) } }, 'MK_GradyBot', 'Grady')
+
+test('presence D1: an un-entered forum topic drops an un-mentioned post even when the group level is false', () => {
+  expect(forumGate(presence(), 'morning all', 77)).toBe('drop')
+  // General is a topic like any other: no "general" entry, absent.
+  expect(forumGate(presence(), 'morning all', undefined)).toBe('drop')
+  // An excused topic drops too.
+  expect(forumGate(presence(), 'morning all', 333)).toBe('drop')
+  expect(requireMentionFor(presence().groups[GROUP], 77, true)).toBe(true)
+  // A group that is not a forum has no topics: its own setting still decides.
+  expect(forumGate(presence(), 'morning all', undefined, MONTY, { id: Number(GROUP), type: 'supergroup' })).toBe('deliver')
+  expect(requireMentionFor(presence().groups[GROUP], 77)).toBe(false)
+})
+
+test('presence D2: an invited forum topic delivers an un-mentioned post, whatever the group level', () => {
+  expect(forumGate(presence(), 'morning all', 40)).toBe('deliver')
+  const strict = presence()
+  strict.groups[GROUP].requireMention = true
+  expect(forumGate(strict, 'morning all', 40)).toBe('deliver')
+  expect(requireMentionFor(strict.groups[GROUP], 40, true)).toBe(false)
+  // Invited in General by its "general" entry.
+  strict.groups[GROUP].threads!.general = { requireMention: false }
+  expect(forumGate(strict, 'morning all', undefined)).toBe('deliver')
+})
+
+/** handleInbound's order for a message that is no command: the mention plan, its run, then the gate. */
+function mentionRig(opts: { access?: CommandAccess; isStatic?: boolean } = {}) {
+  const g = commandRig({ access: opts.access ?? presence(), isStatic: opts.isStatic })
+  const log: string[] = []
+  const { answer, notify } = g.deps
+  g.deps.answer = async (c, t, th) => { log.push(`answer:${t}`); await answer(c, t, th) }
+  g.deps.notify = (v, k) => { log.push(`event:${v}:${k}`); notify(v, k) }
+  const post = async (m: Partial<MentionMessage> & { text: string }, thread: number | null = 77, from: CommandMessage['from'] = { id: MONTY }) => {
+    const message = { text: m.text, ...(thread != null ? { message_thread_id: thread } : {}), ...(m.message ?? {}) }
+    const msg: MentionMessage = { chat_id: GROUP, chat_type: 'supergroup', is_forum: true, from, text: m.text, ...(thread != null ? { message_thread_id: thread } : {}), ...m, message }
+    expect(planGroupCommand(g.deps, msg).kind).toBe('none')
+    const plan = planMentionInvite(g.deps, msg)
+    if (plan) await runGroupCommand(g.deps, plan)
+    const chat = msg.is_forum ? FORUM : { id: Number(GROUP), type: 'supergroup' }
+    const decision = inboundDecision({ dmPolicy: 'allowlist', ...g.access() } as GateAccess, { from: from && { id: from.id }, chat: chat as any, message }, 'MK_GradyBot', 'Grady')
+    log.push(`gate:${decision}`)
+    return { plan, decision }
+  }
+  return { ...g, log, post }
+}
+
+test("presence D3: Monty's @mention in an absent topic writes the thread entry, emits the invite event, and delivers the message", async () => {
+  const g = mentionRig()
+  const before = g.access()
+  const r = await g.post({ text: '@grady what do you make of this?' })
+  expect(r.plan).toEqual({ kind: 'act', verb: 'invite', chat_id: GROUP, thread_id: 77, key: '77' })
+  expect(g.access().groups[GROUP].threads?.['77']).toEqual({ requireMention: false })
+  expect(g.saves.length).toBe(1)
+  // The other entries, and the group level, are untouched.
+  expect({ ...g.access().groups[GROUP].threads, '77': undefined }).toEqual({ ...before.groups[GROUP].threads, '77': undefined })
+  expect(g.access().groups[GROUP].requireMention).toBe(false)
+  // The arrival phrase, the invite event, and then the message itself.
+  expect(g.log).toEqual(['answer:ARRIVE', 'event:invite:77', 'gate:deliver'])
+  expect(g.answers).toEqual([{ chat_id: GROUP, text: 'ARRIVE', thread_id: 77 }])
+  // He is present now: the next post needs no mention, and invites nothing again.
+  const next = await g.post({ text: 'and another thing' })
+  expect(next).toEqual({ plan: undefined, decision: 'deliver' })
+  expect(g.saves.length).toBe(1)
+
+  // Every kind of mention invites: the bot username, a reply to the bot, a pattern.
+  const byEntity = mentionRig()
+  await byEntity.post({ text: 'hi @MK_GradyBot', message: { entities: [{ type: 'mention', offset: 3, length: 12 }] } })
+  expect(byEntity.log).toEqual(['answer:ARRIVE', 'event:invite:77', 'gate:deliver'])
+  const byReply = mentionRig()
+  await byReply.post({ text: 'yes', message: { reply_to_message: { from: { username: 'MK_GradyBot' } } } })
+  expect(byReply.access().groups[GROUP].threads?.['77']).toEqual({ requireMention: false })
+  const pat = presence()
+  pat.mentionPatterns = ['\\bgrady\\b']
+  const byPattern = mentionRig({ access: pat })
+  await byPattern.post({ text: 'grady, thoughts?' })
+  expect(byPattern.log).toEqual(['answer:ARRIVE', 'event:invite:77', 'gate:deliver'])
+  // An excused topic is absent too, and General keys "general".
+  const excused = mentionRig()
+  await excused.post({ text: '@grady come back' }, 333)
+  expect(excused.access().groups[GROUP].threads?.['333']).toEqual({ requireMention: false })
+  const general = mentionRig()
+  await general.post({ text: '@grady' }, null)
+  expect(general.access().groups[GROUP].threads?.general).toEqual({ requireMention: false })
+  expect(general.answers).toEqual([{ chat_id: GROUP, text: 'ARRIVE' }])
+})
+
+test("presence: in a topic the bot created, an /excuse sticks against Monty's plain posts, and his quote-reply to the bot still invites", async () => {
+  // Topic 333 is excused, and its root (message 333) is the bot's own forum_topic_created.
+  const root = { message_id: 333, forum_topic_created: { name: 'Grady' }, from: { username: 'MK_GradyBot' } }
+  const g = mentionRig()
+  const plain = await g.post({ text: 'still thinking out loud', message: { reply_to_message: root } }, 333)
+  expect(plain).toEqual({ plan: undefined, decision: 'drop' })
+  // The id alone marks the root too, as a tee'd or trimmed message carries it.
+  const byId = await g.post({ text: 'and again', message: { reply_to_message: { message_id: 333, from: root.from } } }, 333)
+  expect(byId).toEqual({ plan: undefined, decision: 'drop' })
+  expect(g.access().groups[GROUP].threads?.['333']).toEqual({ requireMention: true })
+  expect(g.saves.length).toBe(0)
+  expect(g.log).toEqual(['gate:drop', 'gate:drop'])
+  // A quote-reply to one of the bot's posts in that topic is a mention, and so an invite.
+  const quote = await g.post({ text: 'yes, do that', message: { reply_to_message: { message_id: 1204, from: root.from } } }, 333)
+  expect(quote.plan).toEqual({ kind: 'act', verb: 'invite', chat_id: GROUP, thread_id: 333, key: '333' })
+  expect(quote.decision).toBe('deliver')
+  expect(g.access().groups[GROUP].threads?.['333']).toEqual({ requireMention: false })
+})
+
+test('presence D3: no mention, a present topic, a non-forum group, an unknown group and a static bridge invite nothing', async () => {
+  const quiet = mentionRig()
+  expect(await quiet.post({ text: 'no name here' })).toEqual({ plan: undefined, decision: 'drop' })
+  const present = mentionRig()
+  expect(await present.post({ text: '@grady' }, 40)).toEqual({ plan: undefined, decision: 'deliver' })
+  const flat = mentionRig()
+  expect((await flat.post({ text: '@grady', is_forum: false })).plan).toBeUndefined()
+  const stat = mentionRig({ isStatic: true })
+  expect(await stat.post({ text: '@grady' })).toEqual({ plan: undefined, decision: 'deliver' })
+  const unknown = mentionRig({ access: { allowFrom: [String(MONTY)], groups: {} } })
+  expect(await unknown.post({ text: '@grady' })).toEqual({ plan: undefined, decision: 'drop' })
+  for (const g of [quiet, present, flat, stat, unknown]) {
+    expect(g.saves).toEqual([])
+    expect(g.answers).toEqual([])
+    expect(g.events).toEqual([])
+  }
+  // A failed write claims nothing; the mention itself is still delivered.
+  const failing = mentionRig()
+  failing.deps.saveAccess = () => { throw new Error('EROFS') }
+  expect((await failing.post({ text: '@grady' })).decision).toBe('deliver')
+  expect(failing.log).toEqual(['gate:deliver'])
+})
+
+test("presence D4: a peer bot's @mention, or anyone else's, in an absent topic is delivered and writes nothing", async () => {
+  // A person outside the top-level allowFrom, a peer bot, and a bot wearing Monty's id.
+  for (const from of [{ id: 222 }, { id: 333, is_bot: true }, { id: MONTY, is_bot: true }]) {
+    const g = mentionRig()
+    const r = await g.post({ text: '@grady over to you' }, 77, from)
+    expect(r).toEqual({ plan: undefined, decision: 'deliver' })
+    expect(g.saves).toEqual([])
+    expect(g.access()).toEqual(presence())
+    expect(g.answers).toEqual([])
+    expect(g.events).toEqual([])
+    // Still absent: their next un-mentioned post drops.
+    expect((await g.post({ text: 'hello?' }, 77, from)).decision).toBe('drop')
+  }
+})
+
+test('presence D3: handleInbound applies a mention invite through runGroupCommand, after the commands and before gate()', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('async function handleInbound(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const early = body.indexOf("if (command.kind !== 'none') {")
+  const plan = body.indexOf('planMentionInvite(deps, { ...commandMessage, message: ctx.message })')
+  const run = body.indexOf('if (mention) await runGroupCommand(deps, mention)')
+  const gateAt = body.indexOf('gate(ctx)')
+  expect(plan).toBeGreaterThan(early)
+  expect(run).toBeGreaterThan(plan)
+  expect(gateAt).toBeGreaterThan(run)
+  expect(body).toContain("is_forum: 'is_forum' in ctx.chat && ctx.chat.is_forum === true,")
+})
+
+test('presence: the invite instruction reads 24h, and /who tells who-hears when a chat is not a forum', async () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  expect(src).toContain('`tail-fleet-posts --thread <id> --since 24h`')
+  expect(src).not.toContain('--since 2h')
+  const f = fleetRig()
+  const vera = f.of('Vera')
+  const flat = planCmd(vera.rig.deps, { chat_id: GROUP, chat_type: 'supergroup', from: { id: MONTY }, text: '/who verbose', message_thread_id: THREAD })
+  expect(flat).toMatchObject({ kind: 'who', flat: true })
+  if (flat.kind === 'who') await runWho({ run: vera.run, answer: vera.rig.deps.answer, stderr: () => {} }, flat)
+  expect(vera.whoCalls.map(c => c.argv)).toEqual([[WHO_HEARS_BIN, '40', '--chat', GROUP, '--no-forum', '--verbose']])
+})
+
+// Amendment A. A new topic has no thread entry, so its creator invites itself
+// on a successful create, by the code /invite runs. Each rig is one bot's own
+// access.json; the api is a stub, so no topic is created anywhere.
+import { runCreateForumTopic } from './forum-topic.ts'
+
+const absentEverywhere = (): CommandAccess => ({ allowFrom: [String(MONTY)], groups: { [GROUP]: { requireMention: false, allowFrom: [], threads: { '40': { requireMention: false } } } } })
+
+function createRig(opts: { isStatic?: boolean } = {}) {
+  const g = commandRig({ access: absentEverywhere(), isStatic: opts.isStatic })
+  const calls: unknown[][] = []
+  const stderr: string[] = []
+  const api = { async createForumTopic(...a: unknown[]) { calls.push(a); return { message_thread_id: 77, name: 'Plans' } } }
+  const create = (assertAllowedChat: (c: string) => void = () => {}) =>
+    runCreateForumTopic({ api, assertAllowedChat, isStatic: g.deps.isStatic, loadAccess: g.deps.loadAccess, saveAccess: g.deps.saveAccess, stderr: l => { stderr.push(l) } }, { chat_id: GROUP, name: 'Plans' })
+  return { ...g, calls, stderr, api, create }
+}
+
+test('presence A: after create_forum_topic the creator is present in the new topic and a second bot is absent', async () => {
+  const creator = createRig()
+  const second = commandRig({ agent: 'Vera', bot: 'MK_VeraBot', access: absentEverywhere() })
+  // Before: a topic nobody was invited to reaches nobody.
+  expect(forumGate(creator.access(), 'morning all', 77)).toBe('drop')
+  const res = await creator.create()
+  expect(creator.calls).toEqual([[GROUP, 'Plans']])
+  expect(res.isError).toBeUndefined()
+  expect(res.content[0].text).toBe('created topic "Plans" (message_thread_id: 77)')
+  // The creator's own entry, written once, and nothing else in its access moved.
+  expect(creator.access().groups[GROUP].threads).toEqual({ '40': { requireMention: false }, '77': { requireMention: false } })
+  expect({ ...creator.access(), groups: undefined }).toEqual({ ...absentEverywhere(), groups: undefined })
+  expect(creator.access().groups[GROUP].requireMention).toBe(false)
+  expect(creator.saves.length).toBe(1)
+  // No arrival phrase and no invite event: the tool result is the agent's notice.
+  // Nothing is posted, not even attempted: an attempt would land on stderr.
+  expect(creator.stderr).toEqual([])
+  expect(creator.answers).toEqual([])
+  expect(creator.events).toEqual([])
+  // Present: an un-mentioned post in the new topic is delivered to the creator.
+  expect(forumGate(creator.access(), 'morning all', 77)).toBe('deliver')
+  expect(requireMentionFor(creator.access().groups[GROUP], 77, true)).toBe(false)
+  // The second bot: nothing written, and the same post is dropped.
+  expect(second.access()).toEqual(absentEverywhere())
+  expect(second.saves).toEqual([])
+  expect(inboundDecision({ dmPolicy: 'allowlist', ...second.access() } as GateAccess, { from: { id: MONTY }, chat: FORUM as any, message: { text: 'morning all', message_thread_id: 77 } }, 'MK_VeraBot', 'Vera')).toBe('drop')
+  expect(requireMentionFor(second.access().groups[GROUP], 77, true)).toBe(true)
+})
+
+test('presence A: a create that fails, or a chat not allowed, writes nothing; a static bridge or a failed write says the bot is not present', async () => {
+  const failing = createRig()
+  failing.api.createForumTopic = async () => { throw new Error('Bad Request: not enough rights to manage topics') }
+  await expect(failing.create()).rejects.toThrow('not enough rights')
+  const denied = createRig()
+  await expect(denied.create(() => { throw new Error('chat is not allowlisted') })).rejects.toThrow('not allowlisted')
+  expect(denied.calls).toEqual([])
+  for (const g of [failing, denied]) {
+    expect(g.saves).toEqual([])
+    expect(g.access()).toEqual(absentEverywhere())
+  }
+  // The topic exists, so neither is an error; the text says what did not happen.
+  const stat = createRig({ isStatic: true })
+  const s = await stat.create()
+  expect(s.isError).toBeUndefined()
+  expect(s.content[0].text).toBe('created topic "Plans" (message_thread_id: 77). This bot is NOT present in it (access is static): it hears only mentions there until Monty invites it.')
+  expect(stat.access()).toEqual(absentEverywhere())
+  const erofs = createRig()
+  erofs.deps.saveAccess = () => { throw new Error('EROFS') }
+  const e = await erofs.create()
+  expect(e.content[0].text).toContain('This bot is NOT present in it (the access.json write failed)')
+  expect(erofs.access()).toEqual(absentEverywhere())
+  expect([...stat.answers, ...erofs.answers, ...stat.events, ...erofs.events]).toEqual([])
+})
+
+test('presence A: the server creates a topic through runCreateForumTopic, with the access the gate reads', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  expect(src).toContain("return await runCreateForumTopic({ api: bot.api, assertAllowedChat, isStatic: STATIC, loadAccess, saveAccess }, args)")
+  expect(src).not.toContain('bot.api.createForumTopic(')
+})
+
+// D6. who-hears is Vera's, in the agents repo; /who answers from it, so it
+// must decide presence as the gate does. This loads the script's own
+// setting() and compares it with requireMentionFor on every case. It reads
+// who-hears at WHO_HEARS_BIN unless WHO_HEARS_BIN_UNDER_TEST names another
+// copy, and only calls setting() on fixture JSON: no access.json, tee log or
+// host is read.
+test('presence D6: who-hears and the gate agree on who is present', () => {
+  const bin = process.env.WHO_HEARS_BIN_UNDER_TEST ?? WHO_HEARS_BIN
+  const policies: Record<string, GroupPolicy> = {
+    'group false': presence().groups[GROUP],
+    'group true': { ...presence().groups[GROUP], requireMention: true },
+    'group false, general invited': { requireMention: false, allowFrom: [], threads: { general: { requireMention: false }, '40': {} } },
+  }
+  const cases = Object.entries(policies).flatMap(([name, policy]) =>
+    [true, false].flatMap(forum =>
+      [40, 333, 77, undefined].map(thread => ({ name, policy, forum, thread, key: thread != null ? String(thread) : 'general' }))))
+  const loader = [
+    'import sys, json, importlib.machinery, importlib.util',
+    'ld = importlib.machinery.SourceFileLoader("who_hears", sys.argv[1])',
+    'spec = importlib.util.spec_from_loader("who_hears", ld)',
+    'wh = importlib.util.module_from_spec(spec)',
+    'ld.exec_module(wh)',
+    'out = []',
+    'for c in json.load(sys.stdin):',
+    '    try:',
+    '        out.append(wh.setting(c["raw"], c["chat"], c["key"]) if c["forum"] else wh.setting(c["raw"], c["chat"], c["key"], False))',
+    '    except Exception as e:',
+    '        out.append("error: %r" % (e,))',
+    'json.dump(out, sys.stdout)',
+  ].join('\n')
+  const input = JSON.stringify(cases.map(c => ({ raw: JSON.stringify({ groups: { [GROUP]: c.policy } }), chat: GROUP, key: c.key, forum: c.forum })))
+  const r = spawnSync('/usr/bin/python3', ['-I', '-B', '-c', loader, bin], { input, encoding: 'utf8', timeout: 20000 })
+  expect(r.stderr).toBe('')
+  expect(r.status).toBe(0)
+  const settings = JSON.parse(r.stdout) as string[]
+  const label = (c: (typeof cases)[number]) => `${c.name} / ${c.forum ? 'forum' : 'not a forum'} / ${c.key}`
+  const says = cases.map((c, i) => `${label(c)}: ${settings[i] === 'hears everything' ? 'present' : settings[i].startsWith('error') ? settings[i] : 'absent'}`)
+  const gate = cases.map(c => `${label(c)}: ${requireMentionFor(c.policy, c.thread, c.forum) ? 'absent' : 'present'}`)
+  expect(says).toEqual(gate)
+  // The spec's fixture, spelled out: group false, 40 invited, 333 excused, 77 never entered.
+  const forum = (key: string) => settings[cases.findIndex(c => c.name === 'group false' && c.forum && c.key === key)]
+  expect([forum('40'), forum('333'), forum('77'), forum('general')]).toEqual(['hears everything', 'excused here', 'only when tagged', 'only when tagged'])
+})
+
+// --- SPEC-bridge-presence-by-invite-2026-11-19, amendment C ----------------------
+// A present bot is delivered every other fleet bot's post in the topic from
+// the post log. Drills D7-D12. Nothing here reaches Telegram, a session, a
+// dispatch or a live post log: notify and the tee are arrays, and the reader
+// is either a canned run or, in D12, the real tail-fleet-posts pointed at
+// fixture directories by its own test hooks (no ssh, no ~/.agents).
+
+import { homedir } from 'os'
+import { RELAY_MAX_PER_HOUR } from './tag-relay.ts'
+import { SeenPosts, deliverPeerPosts, pollPeerPosts, postKey, PEER_POLL_MS, PEER_READ_TIMEOUT_MS, PEER_LOOKBACK_MS, PEER_OVERLAP_MS, PEER_READ_MAX_CHARS, TAIL_FLEET_POSTS_BIN, type PeerDeps, type PeerEvent, type PeerRecord } from './peer-posts.ts'
+
+const T0 = Date.parse('2026-11-20T08:00:00Z')
+const peerOut = (bot: string, message_id: number, thread: number | null, text = `post ${message_id}`, extra: Partial<PeerRecord> = {}): PeerRecord =>
+  ({ ts: new Date(T0).toISOString(), dir: 'out', chat_id: GROUP, thread_id: thread, message_id, reply_to: null, text, edit: false, bot, ...extra })
+
+/** One bridge: presence() access (40 invited, 333 excused, 77 never entered), a clock, and a canned log. */
+function peerRig(opts: { own?: string; file?: string; clock?: { t: number } } = {}) {
+  const clock = opts.clock ?? { t: T0 }
+  const now = () => clock.t
+  const events: PeerEvent[] = []
+  const logged: Array<Record<string, unknown>> = []
+  const lines: string[] = []
+  const runs: Array<{ argv: string[]; timeoutMs: number }> = []
+  const log: { records: PeerRecord[]; rc: number } = { records: [], rc: 0 }
+  const deps: PeerDeps = {
+    ownBot: () => opts.own ?? 'MK_GradyBot',
+    groups: () => presence().groups,
+    seen: new SeenPosts(opts.file, now, undefined, l => lines.push(l)),
+    limiter: new RelayLimiter(RELAY_MAX_PER_HOUR, now),
+    notify: e => events.push(e),
+    tee: e => logged.push(e),
+    run: async (argv, timeoutMs) => {
+      runs.push({ argv, timeoutMs })
+      return { rc: log.rc, stdout: log.records.map(r => JSON.stringify(r)).join('\n') + '\n', stderr: log.rc ? 'mini: UNREADABLE (timeout)\n' : '' }
+    },
+    now,
+    stderr: l => lines.push(l),
+    bin: '/fixture/tail-fleet-posts',
+  }
+  return { deps, events, logged, lines, runs, log, clock }
+}
+
+test("peer posts D7: a peer's post in a present topic is delivered exactly once, across re-reads and a restart", async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'peer-seen-')), 'peer-posts.json')
+  const g = peerRig({ file })
+  g.log.records = [peerOut('MK_MayaBot', 901, 40, 'now playing: Scientist')]
+  expect(await pollPeerPosts(g.deps)).toEqual([{ key: `${GROUP}:901`, bot: 'MK_MayaBot', delivered: true }])
+  expect(g.events).toEqual([{
+    content: 'now playing: Scientist',
+    meta: { chat_id: GROUP, message_id: '901', message_thread_id: '40', user: 'MK_MayaBot', ts: new Date(T0).toISOString(), via: 'post-log' },
+  }])
+  // The delivery is on this bridge's own record, marked as read from the log.
+  expect(g.logged).toEqual([expect.objectContaining({ dir: 'in', chat_id: GROUP, thread_id: 40, message_id: 901, from_user: 'MK_MayaBot', from_is_bot: true, delivered: true, via: 'post-log' })])
+  // The reader is tail-fleet-posts, asked for JSON from just behind the cursor.
+  expect(g.runs).toEqual([{ argv: ['/fixture/tail-fleet-posts', '--json', '--since', new Date(T0 - PEER_OVERLAP_MS).toISOString()], timeoutMs: PEER_READ_TIMEOUT_MS }])
+  // Every later round re-reads the overlap, and an edit is the same post.
+  g.clock.t += PEER_POLL_MS
+  g.log.records.push(peerOut('MK_MayaBot', 901, 40, 'now playing: Scientist (edited)', { edit: true }))
+  expect(await pollPeerPosts(g.deps)).toEqual([])
+  expect(await pollPeerPosts(g.deps)).toEqual([])
+  expect(g.events.length).toBe(1)
+  // A restart: a new bridge on the same state file delivers nothing again,
+  // and reads on from where the last one stopped.
+  const again = peerRig({ file, clock: { t: T0 + 60_000 } })
+  again.log.records = g.log.records
+  expect(again.deps.seen.cursor).toBe(T0 + PEER_POLL_MS)
+  expect(await pollPeerPosts(again.deps)).toEqual([])
+  expect(again.events).toEqual([])
+  // A post made while it was down is delivered; one from before its reach is not asked for.
+  again.log.records = [...g.log.records, peerOut('MK_MayaBot', 902, 40)]
+  expect((await pollPeerPosts(again.deps))!.map(o => o.key)).toEqual([`${GROUP}:902`])
+  const late = peerRig({ file, clock: { t: T0 + 3 * 60 * 60_000 } })
+  await pollPeerPosts(late.deps)
+  expect(late.runs[0].argv[3]).toBe(new Date(T0 + 3 * 60 * 60_000 - PEER_LOOKBACK_MS - PEER_OVERLAP_MS).toISOString())
+  // No state file is a first start: the cursor is now, so no history is delivered.
+  expect(new SeenPosts(join(tmpdir(), 'no-such-peer-state.json'), () => T0).cursor).toBe(T0)
+})
+
+test('peer posts D8: an absent topic gets nothing from the log, whatever the group level', async () => {
+  const g = peerRig()
+  // Group level false; 77 never entered, 333 excused, General not entered, and a group not in access at all.
+  g.log.records = [
+    peerOut('MK_MayaBot', 911, 77),
+    peerOut('MK_MayaBot', 912, 333),
+    peerOut('MK_MayaBot', 913, null),
+    peerOut('MK_MayaBot', 914, 40, 'elsewhere', { chat_id: '-100999' }),
+    peerOut('MK_MayaBot', 915, 77, '@grady look at this'),
+  ]
+  expect(await pollPeerPosts(g.deps)).toEqual([])
+  expect(g.events).toEqual([])
+  expect(g.logged).toEqual([])
+  expect(g.lines).toEqual([])
+  // Nothing was taken either: absent is not "seen".
+  expect(g.deps.seen.has(postKey(GROUP, 911))).toBe(false)
+  // The same posts in the invited topic are delivered: the topic decided, not the post.
+  expect(deliverPeerPosts(g.deps, [peerOut('MK_MayaBot', 916, 40)]).length).toBe(1)
+})
+
+test('peer posts D9: a post Telegram already delivered is not delivered again from the log, in either order', async () => {
+  // Telegram first (Vera's bot receives peers natively): handleInbound takes the key.
+  const g = peerRig({ own: 'MK_VeraBot' })
+  expect(g.deps.seen.take(postKey(Number(GROUP), 921))).toBe(true)
+  g.log.records = [peerOut('MK_MayaBot', 921, 40), peerOut('MK_MayaBot', 922, 40)]
+  expect((await pollPeerPosts(g.deps))!.map(o => o.key)).toEqual([`${GROUP}:922`])
+  expect(g.events.map(e => e.meta.message_id)).toEqual(['922'])
+  // The log first: when Telegram's copy arrives, the key is already taken.
+  expect(g.deps.seen.take(postKey(Number(GROUP), 922))).toBe(false)
+
+  // The server: a bot's group post takes the key after the gate has decided,
+  // and a delivery that is not the first sight stops there.
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('async function handleInbound(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const gateAt = body.indexOf('const result = teeInbound(teeArgs, () => gate(ctx))')
+  const peer = body.indexOf('const peerPost = ctx.from?.is_bot === true && ctx.chat != null && isGroupChatId(ctx.chat.id) && ctx.message?.message_id != null')
+  const take = body.indexOf('const firstSight = !peerPost || peerSeen.take(postKey(ctx.chat!.id, ctx.message!.message_id))')
+  const stop = body.indexOf("if (result.action === 'deliver' && !firstSight) return")
+  const deliver = body.indexOf("method: 'notifications/claude/channel',", stop)
+  expect(gateAt).toBeGreaterThan(-1)
+  expect(peer).toBeGreaterThan(gateAt)
+  expect(take).toBeGreaterThan(peer)
+  expect(stop).toBeGreaterThan(take)
+  expect(deliver).toBeGreaterThan(stop)
+  // One set, shared by both paths and kept in the state dir.
+  expect(src).toContain("const peerSeen = new SeenPosts(join(STATE_DIR, 'peer-posts.json'))")
+  expect(src).toContain('  seen: peerSeen,\n')
+})
+
+test('peer posts D10: the 7th delivery in an hour from one peer is skipped and logged, once, per pair', async () => {
+  const g = peerRig()
+  g.log.records = [1, 2, 3, 4, 5, 6, 7].map(i => peerOut('MK_MayaBot', 930 + i, 40))
+  const first = (await pollPeerPosts(g.deps))!
+  expect(first.map(o => o.delivered)).toEqual([true, true, true, true, true, true, false])
+  expect(first[6]).toEqual({ key: `${GROUP}:937`, bot: 'MK_MayaBot', delivered: false, skipped: 'rate' })
+  expect(g.events.map(e => e.meta.message_id)).toEqual(['931', '932', '933', '934', '935', '936'])
+  expect(g.lines).toEqual([`telegram channel: peer post MK_MayaBot -> MK_GradyBot skipped: over ${RELAY_MAX_PER_HOUR} deliveries in the last hour (${GROUP}:937)\n`])
+  expect(g.logged.length).toBe(7)
+  expect(g.logged[6]).toEqual(expect.objectContaining({ message_id: 937, delivered: false, skipped: 'rate', via: 'post-log' }))
+  expect(g.logged[5]).not.toHaveProperty('skipped')
+  // The bound is per pair: another peer's post still arrives.
+  g.log.records.push(peerOut('MK_WernerBot', 940, 40))
+  expect((await pollPeerPosts(g.deps))!).toEqual([{ key: `${GROUP}:940`, bot: 'MK_WernerBot', delivered: true }])
+  // The skipped post is not delivered later, and says nothing again.
+  g.clock.t += 61 * 60_000
+  g.log.records.push(peerOut('MK_MayaBot', 941, 40))
+  expect((await pollPeerPosts(g.deps))!).toEqual([{ key: `${GROUP}:941`, bot: 'MK_MayaBot', delivered: true }])
+  expect(g.events.map(e => e.meta.message_id)).not.toContain('937')
+  expect(g.lines.length).toBe(1)
+})
+
+test("peer posts D11: a bot's own post is never delivered back to it, and a bridge that does not know its name delivers nothing", async () => {
+  const g = peerRig({ own: 'MK_GradyBot' })
+  g.log.records = [peerOut('MK_GradyBot', 951, 40), peerOut('mk_gradybot', 952, 40), peerOut('MK_MayaBot', 953, 40)]
+  expect((await pollPeerPosts(g.deps))!.map(o => o.key)).toEqual([`${GROUP}:953`])
+  expect(g.events.map(e => e.meta.user)).toEqual(['MK_MayaBot'])
+  expect(g.logged.map(e => e.message_id)).toEqual([953])
+  // Only the posting bot's own record is a post: what another bot received is not one.
+  expect(deliverPeerPosts(g.deps, [{ ...peerOut('MK_VeraBot', 954, 40), dir: 'in' }, { ...peerOut('', 955, 40), bot: undefined }])).toEqual([])
+  // Before polling starts the username is '': it cannot tell its own posts, so it reads and delivers nothing.
+  const unnamed = peerRig({ own: '' })
+  unnamed.log.records = g.log.records
+  expect(deliverPeerPosts(unnamed.deps, unnamed.log.records)).toEqual([])
+  expect(await pollPeerPosts(unnamed.deps)).toEqual([])
+  expect(unnamed.runs).toEqual([])
+  expect(unnamed.events).toEqual([])
+})
+
+// D12 runs the real tail-fleet-posts (monty-ops, the one reader of both hosts)
+// against two fixture directories standing for maxi's and mini's logs. Its own
+// test hooks name this host, its directory, and the command that reads the
+// other host, so no ssh runs and no live log is read.
+function twoHosts() {
+  const base = mkdtempSync(join(tmpdir(), 'peer-hosts-'))
+  const dirs = { maxi: join(base, 'maxi'), mini: join(base, 'mini') }
+  realFs.mkdirSync(dirs.maxi)
+  realFs.mkdirSync(dirs.mini)
+  const ts = new Date().toISOString()
+  fsWrite(join(dirs.maxi, 'MK_GradyBot.jsonl'), JSON.stringify({ ...peerOut('MK_GradyBot', 961, 40, 'Grady, from maxi'), ts }) + '\n')
+  fsWrite(join(dirs.mini, 'MK_MayaBot.jsonl'), JSON.stringify({ ...peerOut('MK_MayaBot', 962, 40, 'Maya, from mini'), ts }) + '\n')
+  const runAs = (host: 'maxi' | 'mini', readOther?: string): OutputRunner => async (argv, timeoutMs) => {
+    const other = host === 'maxi' ? 'mini' : 'maxi'
+    const r = spawnSync(argv[0], argv.slice(1), {
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      env: {
+        PATH: '/usr/bin:/bin',
+        TAIL_FLEET_POSTS_HOST: host,
+        TAIL_FLEET_POSTS_DIR: dirs[host],
+        [`TAIL_FLEET_POSTS_READ_${other.toUpperCase()}`]: readOther ?? `${TAIL_FLEET_POSTS_BIN} --dump ${dirs[other]}`,
+      },
+    })
+    return { rc: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
+  }
+  const bridge = (own: string, run: OutputRunner) => {
+    const clock = { t: Date.now() }
+    const g = peerRig({ own, clock })
+    g.deps.run = run
+    g.deps.bin = undefined
+    return g
+  }
+  return { runAs, bridge }
+}
+
+test('peer posts D12: a post by Maya on mini reaches a bot on maxi, and a post from maxi reaches Maya on mini', async () => {
+  expect(TAIL_FLEET_POSTS_BIN).toBe(join(homedir(), '.local', 'bin', 'tail-fleet-posts'))
+  expect(existsSync(TAIL_FLEET_POSTS_BIN)).toBe(true)
+  const h = twoHosts()
+  const grady = h.bridge('MK_GradyBot', h.runAs('maxi'))
+  expect(await pollPeerPosts(grady.deps)).toEqual([{ key: `${GROUP}:962`, bot: 'MK_MayaBot', delivered: true }])
+  expect(grady.events.map(e => [e.meta.user, e.content])).toEqual([['MK_MayaBot', 'Maya, from mini']])
+  const maya = h.bridge('MK_MayaBot', h.runAs('mini'))
+  expect(await pollPeerPosts(maya.deps)).toEqual([{ key: `${GROUP}:961`, bot: 'MK_GradyBot', delivered: true }])
+  expect(maya.events.map(e => [e.meta.user, e.content])).toEqual([['MK_GradyBot', 'Grady, from maxi']])
+})
+
+test('peer posts D12: while the other host cannot be read nothing is delivered and it is said once; the next good read delivers', async () => {
+  const h = twoHosts()
+  const g = h.bridge('MK_GradyBot', h.runAs('maxi', '/usr/bin/false'))
+  const cursor = g.deps.seen.cursor
+  expect(await pollPeerPosts(g.deps)).toBeUndefined()
+  expect(await pollPeerPosts(g.deps)).toBeUndefined()
+  expect(g.events).toEqual([])
+  expect(g.deps.seen.cursor).toBe(cursor)
+  expect(g.lines.length).toBe(1)
+  expect(g.lines[0]).toStartWith('telegram channel: post log unreadable, no peer posts delivered until it reads again: rc=3 mini: UNREADABLE')
+  g.deps.run = h.runAs('maxi')
+  g.clock.t += PEER_POLL_MS
+  expect((await pollPeerPosts(g.deps))!.map(o => o.key)).toEqual([`${GROUP}:962`])
+  expect(g.lines[1]).toBe('telegram channel: post log reads again\n')
+  expect(g.deps.seen.cursor).toBe(cursor + PEER_POLL_MS)
+})
+
+test('peer posts: the server polls the log only after initialized, every 5s, through the shared reader, and tells the agent what a peer post is', () => {
+  // 5s between rounds and tail-fleet-posts' own 5s bound on a host: 10s from post to delivery.
+  expect(PEER_POLL_MS).toBeLessThanOrEqual(5000)
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const init = src.indexOf('if (!(await clientInitialized)) {')
+  const loop = src.indexOf('  void peerPostLoop()\n')
+  const start = src.indexOf('await bot.start({')
+  expect(init).toBeGreaterThan(-1)
+  expect(loop).toBeGreaterThan(init)
+  expect(start).toBeGreaterThan(loop)
+  expect(src).toContain('      await pollPeerPosts(peerDeps)\n')
+  expect(src).toContain('    await new Promise(r => setTimeout(r, Math.max(0, PEER_POLL_MS - (Date.now() - started))))')
+  expect(src).toContain('  groups: () => loadAccess().groups,\n')
+  expect(src).toContain('  run: spawnOutput,\n  notify: event => {\n    mcp.notification({ method: \'notifications/claude/channel\', params: event })')
+  expect(src).toContain('via="post-log"')
+})
+
+test('peer posts: a busy read is kept whole, past the runner\'s default cap', async () => {
+  // The runner stops keeping output once it holds its cap, so a read that
+  // arrives in more than one piece loses everything after the first.
+  const big = ['/bin/sh', '-c', 'head -c 20000 /dev/zero | tr "\\0" x; sleep 0.3; head -c 200000 /dev/zero | tr "\\0" y']
+  expect((await spawnOutput(big, 5000)).stdout).not.toContain('y')
+  expect((await spawnOutput(big, 5000, PEER_READ_MAX_CHARS)).stdout.length).toBe(220000)
+  const g = peerRig()
+  let cap: number | undefined
+  g.deps.run = async (_argv, _timeoutMs, maxStdout) => { cap = maxStdout; return { rc: 0, stdout: '', stderr: '' } }
+  await pollPeerPosts(g.deps)
+  expect(cap).toBe(PEER_READ_MAX_CHARS)
+  expect(PEER_READ_MAX_CHARS).toBeGreaterThanOrEqual(1024 * 1024)
 })

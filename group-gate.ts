@@ -10,6 +10,13 @@
  *
  * SPEC-bridge-names-invite-excuse-2026-11-09, item 1: `@<name>` for this
  * bridge's agent counts as a mention with no configuration.
+ *
+ * SPEC-bridge-presence-by-invite-2026-11-19, item 1: in a forum (a chat whose
+ * `is_forum` is true) presence is the thread entry and nothing else. A thread
+ * with `requireMention:false` is present and hears every post. A thread with
+ * no entry, or with `requireMention:true`, is absent and hears only a
+ * mention, whatever the group's own setting says. A group that is not a forum
+ * has no topics to be invited to, and decides as before.
  */
 
 export type ThreadPolicy = { requireMention?: boolean }
@@ -29,7 +36,7 @@ export type GateMessage = {
   entities?: Entity[]
   caption_entities?: Entity[]
   message_thread_id?: number
-  reply_to_message?: { from?: { username?: string } }
+  reply_to_message?: { message_id?: number; forum_topic_created?: unknown; from?: { username?: string } }
 }
 
 /**
@@ -42,8 +49,9 @@ export function threadKey(threadId: number | undefined): string {
   return threadId != null ? String(threadId) : 'general'
 }
 
-export function requireMentionFor(policy: GroupPolicy, threadId: number | undefined): boolean {
+export function requireMentionFor(policy: GroupPolicy, threadId: number | undefined, isForum = false): boolean {
   const thread = policy.threads?.[threadKey(threadId)]
+  if (isForum) return thread?.requireMention !== false
   return thread?.requireMention ?? policy.requireMention ?? true
 }
 
@@ -55,6 +63,21 @@ export function requireMentionFor(policy: GroupPolicy, threadId: number | undefi
 export function nameMentionPattern(agent: string | undefined): RegExp | undefined {
   if (!agent || !/^[A-Za-z][A-Za-z0-9]*$/.test(agent)) return undefined
   return new RegExp(`(^|[^\\w@])@${agent}(?![\\w])`, 'i')
+}
+
+/**
+ * In a forum every plain post in a topic carries reply_to_message = the topic
+ * root (the forum_topic_created service message, whose message_id is the
+ * topic's message_thread_id). That is the client filing the post, not the
+ * sender replying to anyone, so it is no mention: in a topic this bot created
+ * the root is the bot's own message, and counting it would make every post
+ * there a mention and no /excuse could stick.
+ */
+export function repliesToTopicRoot(message: GateMessage | undefined): boolean {
+  const reply = message?.reply_to_message
+  if (!reply) return false
+  if (reply.forum_topic_created != null) return true
+  return reply.message_id != null && reply.message_id === message?.message_thread_id
 }
 
 export function isMentioned(
@@ -76,7 +99,7 @@ export function isMentioned(
   }
 
   // Reply to one of our messages counts as an implicit mention.
-  if (message?.reply_to_message?.from?.username === botUsername) return true
+  if (!repliesToTopicRoot(message) && message?.reply_to_message?.from?.username === botUsername) return true
 
   if (nameMentionPattern(agent)?.test(text)) return true
 
@@ -97,11 +120,12 @@ export function groupDecision(
   botUsername: string,
   mentionPatterns?: string[],
   agent?: string,
+  isForum = false,
 ): 'deliver' | 'drop' {
   if (!policy) return 'drop'
   const groupAllowFrom = policy.allowFrom ?? []
   if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) return 'drop'
-  const requireMention = requireMentionFor(policy, message?.message_thread_id)
+  const requireMention = requireMentionFor(policy, message?.message_thread_id, isForum)
   if (requireMention && !isMentioned(message, botUsername, mentionPatterns, agent)) return 'drop'
   return 'deliver'
 }

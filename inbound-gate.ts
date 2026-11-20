@@ -39,7 +39,7 @@ export function inboundDecision(
   access: GateAccess,
   p: {
     from?: { id: number }
-    chat?: { id: number | string; type?: string }
+    chat?: { id: number | string; type?: string; is_forum?: boolean }
     message?: GateMessage
   },
   botUsername: string,
@@ -59,10 +59,11 @@ export function inboundDecision(
   }
 
   if (chatType === 'group' || chatType === 'supergroup') {
-    // requireMention can be set per thread (groups[id].threads[thread_id]);
-    // see group-gate.ts. access.json is re-read on every message.
+    // requireMention can be set per thread (groups[id].threads[thread_id]),
+    // and in a forum the thread entry alone decides; see group-gate.ts.
+    // access.json is re-read on every message.
     const policy = access.groups[String(p.chat!.id)]
-    return groupDecision(policy, senderId, p.message, botUsername, access.mentionPatterns, agent)
+    return groupDecision(policy, senderId, p.message, botUsername, access.mentionPatterns, agent, p.chat!.is_forum === true)
   }
 
   return 'drop'

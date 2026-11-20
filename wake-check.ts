@@ -54,7 +54,7 @@ import { homedir } from 'os'
 import { basename, join } from 'path'
 import { ALLOWED_UPDATES, inboundDecision, inboundText, parseEnvFile, type GateAccess } from './inbound-gate.ts'
 import { threadKey } from './group-gate.ts'
-import { applyGroupCommand, planGroupCommand, type CommandDeps, type CommandPlan } from './invite-excuse.ts'
+import { applyGroupCommand, planGroupCommand, planMentionInvite, type CommandDeps, type CommandPlan } from './invite-excuse.ts'
 import { makeTee, outEntry, safeTee, teeInbound, isGroupChatId, TEE_DIR, type Tee } from './post-log.ts'
 
 export const EXIT = { NOTHING: 0, USAGE: 2, PEEK_FAILED: 3, REFUSED: 4, DELIVER: 10 } as const
@@ -86,10 +86,14 @@ export type ClassifyEnv = {
 
 type GroupMessage = NonNullable<Update['message']>
 
+const planDeps = (env: ClassifyEnv) =>
+  ({ agent: env.agent, botUsername: () => env.me.username, isStatic: env.isStatic, loadAccess: () => env.access }) as unknown as CommandDeps
+const planMessage = (m: GroupMessage) =>
+  ({ chat_id: String(m.chat.id), chat_type: m.chat.type, from: m.from, text: m.text, message_thread_id: m.message_thread_id, is_forum: 'is_forum' in m.chat && m.chat.is_forum === true })
+
 /** The bridge's own /invite, /excuse and /who plan for one message, against env.access. */
 function groupPlan(m: GroupMessage, env: ClassifyEnv): CommandPlan {
-  const deps = { agent: env.agent, botUsername: () => env.me.username, loadAccess: () => env.access } as unknown as CommandDeps
-  return planGroupCommand(deps, { chat_id: String(m.chat.id), chat_type: m.chat.type, from: m.from, text: m.text, message_thread_id: m.message_thread_id })
+  return planGroupCommand(planDeps(env), planMessage(m))
 }
 
 /**
@@ -123,6 +127,13 @@ export function classifyUpdate(update: Update, env: ClassifyEnv): Verdict {
     // The bridge must launch to apply it, and the bridge answers it.
     if (plan.kind === 'act') return { action: 'deliver', why: plan.verb, noAck: 'group command' }
     if (plan.kind === 'ignore') return { action: 'drop', why: 'command-not-mine', tee }
+
+    // Monty's mention in a topic the bot is absent from: the bridge must
+    // launch to apply the invite it stands for. Acknowledged like any message,
+    // because the agent then answers it.
+    if (planMentionInvite(planDeps(env), { ...planMessage(m), message: m })) {
+      return { action: 'deliver', why: 'mention-invite', ack: { chat_id, thread_id } }
+    }
 
     const decision = inboundDecision(env.access, ctx, bot, env.agent)
     if (decision === 'deliver') {
