@@ -12,7 +12,9 @@ SPEC-bridge-presence-by-invite-2026-11-19 (ids D*, one or more per drill;
 DA* are its amendment A, the creator present in a topic it creates; C* are
 its amendment C, peer bot posts delivered from the post log, drills D7-D12).
 Extended for SPEC-bridge-inbound-context-stamp-2026-11-20 (ids S*, drills
-S1-S6).
+S1-S6). Extended for amendment D of the presence spec (ids D13*-D22*, named
+for the drill each proves: the per-topic peer cap and its reset on Monty's
+post, his @everyone, the wake on it, and /halt and /stop).
 
 The baseline includes "presence D6", which loads Vera's who-hears from the
 agents repo and requires it to agree with the gate. To run against a copy of
@@ -666,6 +668,39 @@ REVERTS = [
      "  if (!fromMonty(deps.allowFrom(), post.from)) return undefined\n",
      "",
      "halt D22: a peer bot's /halt, or anyone else's, suspends nothing"),
+    # amendment D: @everyone, drills D15-D18
+    ("D15", "everyone: tag", "inbound-gate.ts",
+     "  return EVERYONE_RE.test(p.message?.text ?? p.message?.caption ?? '')\n",
+     "  return false\n",
+     "everyone D15: Monty's @everyone in a present topic carries tagged=\"everyone\""),
+    ("D15x", "everyone: word", "inbound-gate.ts",
+     "export const EVERYONE_RE = /(^|[^\\w@])@everyone(?![\\w])/i",
+     "export const EVERYONE_RE = /@everyone/i",
+     "everyone D15: Monty's @everyone in a present topic carries tagged=\"everyone\""),
+    ("D15w", "everyone: wiring", "server.ts",
+     "        ...(everyone ? { tagged: 'everyone' } : {}),\n",
+     "",
+     "everyone D15: Monty's @everyone in a present topic carries tagged=\"everyone\""),
+    ("D16", "everyone: absent", "group-gate.ts",
+     "  if (nameMentionPattern(agent)?.test(text)) return true\n",
+     "  if (nameMentionPattern(agent)?.test(text) || /@everyone/i.test(text)) return true\n",
+     "everyone D16: in an absent topic @everyone delivers nothing and writes no thread entry"),
+    ("D16p", "everyone: absent", "inbound-gate.ts",
+     "  if (requireMentionFor(policy, p.message?.message_thread_id, p.chat.is_forum === true)) return false\n",
+     "",
+     "everyone D16: in an absent topic @everyone delivers nothing and writes no thread entry"),
+    ("D17", "everyone: Monty", "inbound-gate.ts",
+     "  if (!fromMonty(access.allowFrom, p.from)) return false\n",
+     "",
+     "everyone D17: a peer bot's @everyone, or anyone else's, carries no tag"),
+    ("D18", "everyone: wake", "wake-check.ts",
+     "everyoneTagged(env.access, ctx) ? 'everyone' : 'group'",
+     "'group'",
+     "everyone D18: Monty's @everyone wakes a sleeping bot in a topic it is present in, and only there"),
+    ("D18a", "everyone: wake", "group-gate.ts",
+     "  if (nameMentionPattern(agent)?.test(text)) return true\n",
+     "  if (nameMentionPattern(agent)?.test(text) || /@everyone/i.test(text)) return true\n",
+     "everyone D18: end to end, @everyone in an absent topic is confirmed and the one in a present topic exits 10 unconfirmed"),
 ]
 
 FAIL_RE = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)

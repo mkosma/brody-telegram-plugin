@@ -2046,3 +2046,71 @@ test("halt D22: a peer bot's /halt, or anyone else's, suspends nothing", () => {
   // In a DM it is not a topic's command.
   expect(g.says(undefined, { id: MONTY }, 'private', '/halt')).toBeUndefined()
 })
+
+// ---------------------------------------------------------------------------
+// Amendment D: Monty's @everyone tags every bot present in the topic.
+// Drills D15-D17 (D18, the wake, is in wake-check.test.ts).
+// ---------------------------------------------------------------------------
+import { everyoneTagged, fromMonty, EVERYONE_RE } from './inbound-gate.ts'
+
+/** One post in the presence() forum (40 invited, 333 excused, 77 never entered): is it tagged, and what does the gate do? */
+function everyonePost(text: string, thread: number | undefined, from: { id: number; is_bot?: boolean } = { id: MONTY }, message: Record<string, unknown> = { text }) {
+  const access = { dmPolicy: 'allowlist', ...presence() } as GateAccess
+  const p = { from, chat: FORUM as any, message: { ...message, ...(thread != null ? { message_thread_id: thread } : {}) } }
+  return { tagged: everyoneTagged(access, p), decision: inboundDecision(access, p, 'MK_GradyBot', 'Grady') }
+}
+
+test('everyone D15: Monty\'s @everyone in a present topic carries tagged="everyone"', () => {
+  for (const text of ['@everyone status?', 'ok @Everyone, thoughts', 'so, @EVERYONE.', 'where are we\n@everyone']) {
+    expect(everyonePost(text, 40)).toEqual({ tagged: true, decision: 'deliver' })
+  }
+  // On a photo it is the caption that says it.
+  expect(everyonePost('', 40, { id: MONTY }, { caption: 'look @everyone' }).tagged).toBe(true)
+  // A whole word: not part of an address, a longer name, or a word without the @.
+  for (const text of ['mail x@everyone.com', '@everyone2', '@everyoneelse', 'everyone, hello', '@@everyone', 'no tag here']) {
+    expect(everyonePost(text, 40)).toEqual({ tagged: false, decision: 'deliver' })
+  }
+  expect(EVERYONE_RE.test('@everyone')).toBe(true)
+  // The server puts it on the event it delivers, from the access the gate just read.
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('async function handleInbound(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const dropped = body.indexOf("if (result.action === 'drop') return")
+  const tag = body.indexOf('  const everyone = everyoneTagged(access, { from, chat: ctx.chat, message: ctx.message })\n')
+  const meta = body.indexOf("        ...(everyone ? { tagged: 'everyone' } : {}),\n")
+  expect(tag).toBeGreaterThan(dropped)
+  expect(meta).toBeGreaterThan(tag)
+  expect(src).toContain('tagged="everyone" is one where he wrote @everyone in a topic you are present in. Treat it as a tag to you: under the fleet response rules each tagged bot owes him an answer.')
+})
+
+test('everyone D16: in an absent topic @everyone delivers nothing and writes no thread entry', async () => {
+  // Never entered, excused, and General with no entry: no tag, and the gate drops it.
+  for (const thread of [77, 333, undefined]) {
+    expect(everyonePost('@everyone status?', thread)).toEqual({ tagged: false, decision: 'drop' })
+  }
+  // It is no mention, so it is no invite: nothing is written, said or told.
+  const g = mentionRig()
+  expect(await g.post({ text: '@everyone status?' }, 77)).toEqual({ plan: undefined, decision: 'drop' })
+  expect(await g.post({ text: '@everyone come back' }, 333)).toEqual({ plan: undefined, decision: 'drop' })
+  expect(g.saves).toEqual([])
+  expect(g.access()).toEqual(presence())
+  expect(g.answers).toEqual([])
+  expect(g.events).toEqual([])
+  expect(isMentioned({ text: '@everyone status?' }, 'MK_GradyBot', undefined, 'Grady')).toBe(false)
+  // A group the bridge has no entry for, and a DM, are no topic at all.
+  const access = { dmPolicy: 'allowlist', ...presence() } as GateAccess
+  expect(everyoneTagged(access, { from: { id: MONTY }, chat: { id: -100999, type: 'supergroup', is_forum: true }, message: { text: '@everyone', message_thread_id: 40 } })).toBe(false)
+  expect(everyoneTagged(access, { from: { id: MONTY }, chat: { id: MONTY, type: 'private' }, message: { text: '@everyone' } })).toBe(false)
+})
+
+test("everyone D17: a peer bot's @everyone, or anyone else's, carries no tag", () => {
+  // A peer bot, a person outside allowFrom, and a bot wearing Monty's id: delivered in a present topic, as plain text.
+  for (const from of [{ id: 333, is_bot: true }, { id: 222 }, { id: MONTY, is_bot: true }]) {
+    expect(everyonePost('@everyone status?', 40, from)).toEqual({ tagged: false, decision: 'deliver' })
+  }
+  expect(everyoneTagged({ allowFrom: [String(MONTY)], groups: presence().groups }, { from: undefined, chat: FORUM, message: { text: '@everyone', message_thread_id: 40 } })).toBe(false)
+  // Monty is whoever the top-level allowFrom names, not an id in the code.
+  expect(fromMonty(['222'], { id: 222 })).toBe(true)
+  expect(fromMonty(['222'], { id: MONTY })).toBe(false)
+  expect(everyoneTagged({ allowFrom: ['222'], groups: presence().groups }, { from: { id: 222 }, chat: FORUM, message: { text: '@everyone', message_thread_id: 40 } })).toBe(true)
+})

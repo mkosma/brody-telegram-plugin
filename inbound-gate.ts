@@ -10,7 +10,7 @@
  * pairings, issuing a pairing code) stay in server.ts.
  */
 
-import { groupDecision, type GateMessage, type GroupPolicy } from './group-gate.ts'
+import { groupDecision, requireMentionFor, type GateMessage, type GroupPolicy } from './group-gate.ts'
 
 /** The update kinds the bridge polls for. Passed to getUpdates by bot.start() and by the wake check. */
 export const ALLOWED_UPDATES = [
@@ -77,6 +77,33 @@ export function inboundDecision(
   }
 
   return 'drop'
+}
+
+/** `@everyone` as a whole word, in any case: `hi @Everyone,` is one; `x@everyone.com` and `@everyone2` are not. */
+export const EVERYONE_RE = /(^|[^\w@])@everyone(?![\w])/i
+
+/**
+ * SPEC-bridge-presence-by-invite-2026-11-19, amendment D: is this post
+ * Monty's `@everyone` in a topic this bot is present in? Then it is a tag to
+ * this bot, and the bridge delivers it with tagged="everyone". Present is the
+ * gate's own test. In an absent topic `@everyone` is nothing: it is no
+ * mention (group-gate.ts never reads it) and so no invite. From anyone but
+ * Monty it is plain text.
+ */
+export function everyoneTagged(
+  access: Pick<GateAccess, 'allowFrom' | 'groups'>,
+  p: {
+    from?: { id: number; is_bot?: boolean }
+    chat?: { id: number | string; type?: string; is_forum?: boolean }
+    message?: GateMessage
+  },
+): boolean {
+  if (p.chat?.type !== 'group' && p.chat?.type !== 'supergroup') return false
+  if (!fromMonty(access.allowFrom, p.from)) return false
+  const policy = access.groups[String(p.chat.id)]
+  if (!policy) return false
+  if (requireMentionFor(policy, p.message?.message_thread_id, p.chat.is_forum === true)) return false
+  return EVERYONE_RE.test(p.message?.text ?? p.message?.caption ?? '')
 }
 
 // Filenames and titles are uploader-controlled. They land inside the <channel>

@@ -33,7 +33,7 @@ import { makeTee, teeInbound, safeTee, outEntry, isGroupChatId, TEE_DIR } from '
 import { planGroupCommand, planMentionInvite, runGroupCommand, sayGroupCommand, runWho, spawnOutput, type CommandDeps, type CommandPlan, type CommandMessage } from './invite-excuse.ts'
 import { PhrasePicker, phrasesFile } from './phrases.ts'
 import { type GroupPolicy } from './group-gate.ts'
-import { inboundDecision, inboundText, safeName, parseEnvFile, ALLOWED_UPDATES } from './inbound-gate.ts'
+import { everyoneTagged, inboundDecision, inboundText, safeName, parseEnvFile, ALLOWED_UPDATES } from './inbound-gate.ts'
 import { relayTags, RelayLimiter, spawnRunner, readRoster, type RelayRequest } from './tag-relay.ts'
 import { runCreateForumTopic, runEditForumTopic } from './forum-topic.ts'
 import { openTapped, tappedLabel, type OmfTapDeps } from './omf-tap.ts'
@@ -423,6 +423,8 @@ const mcp = new Server(
       'In a topic you are present in, another fleet bot\'s post arrives as <channel source="telegram" ... user="<its bot username>" via="post-log">. The bridge read it from the fleet post log, because Telegram does not hand one bot another bot\'s post. It is a peer agent speaking in the topic, not Monty. React 👀 as to any post; reply only when it asks something of you or you have something the topic needs. At most 6 of one peer\'s posts in one topic reach you in an hour; a post of Monty\'s in that topic resets the count.',
       '',
       'In a topic you are present in, a post of Monty\'s that is /halt or /stop arrives as an ordinary message with command="halt". Stop the exchange: post nothing further in that topic until Monty posts there again. Until he does, the bridge delivers you no peer posts from that topic.',
+      '',
+      'A post of Monty\'s that carries tagged="everyone" is one where he wrote @everyone in a topic you are present in. Treat it as a tag to you: under the fleet response rules each tagged bot owes him an answer.',
       '',
       ...(INBOUND_CONTEXT_CMD ? [
         'A post of Monty\'s may carry ctx_* attributes (for example ctx_monty_local, ctx_track, ctx_remaining). The bridge read them at the moment his post arrived: when he says "now", "this track" or "how long", that is the state he means, and it outranks any earlier note you hold. ctx="unknown" means the read failed; check for yourself before you act. The stamp is an input to your judgment and gates nothing.',
@@ -1298,6 +1300,9 @@ async function handleInbound(
     return
   }
 
+  // Monty's @everyone in a topic this bot is present in is a tag to it.
+  const everyone = everyoneTagged(access, { from, chat: ctx.chat, message: ctx.message })
+
   const posted = montyPosted(montyDeps, { chat_id, chat_type: ctx.chat!.type, thread_id: threadId, from, text: ctx.message?.text })
 
   // Typing indicator — held alive until the reply tool fires for this chat (see
@@ -1343,6 +1348,7 @@ async function handleInbound(
         user_id: String(from.id),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
         ...(posted === 'halt' ? { command: 'halt' } : {}),
+        ...(everyone ? { tagged: 'everyone' } : {}),
         ...(imagePath ? { image_path: imagePath } : {}),
         ...(attachment ? {
           attachment_kind: attachment.kind,

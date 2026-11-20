@@ -472,6 +472,34 @@ test('presence D5: end to end, chatter in an absent topic is confirmed and the m
   expect(JSON.parse(readFileSync(join(f.stateDir, 'access.json'), 'utf8'))).toEqual(OPEN_GROUP)
 })
 
+// Amendment D, D18.
+test("everyone D18: Monty's @everyone wakes a sleeping bot in a topic it is present in, and only there", () => {
+  const e = env(OPEN_GROUP)
+  expect(classifyUpdate(grp('@everyone where are we?', 40), e)).toEqual({ action: 'deliver', why: 'everyone', ack: { chat_id: String(GROUP_ID), thread_id: 40 } })
+  // Absent (never entered, excused, General): it is no mention and no invite, so no wake.
+  expect(classifyUpdate(grp('@everyone where are we?', 77), e)).toMatchObject({ action: 'drop', why: 'gate' })
+  expect(classifyUpdate(grp('@everyone', 333), e)).toMatchObject({ action: 'drop', why: 'gate' })
+  expect(classifyUpdate(grp('@everyone'), e)).toMatchObject({ action: 'drop', why: 'gate' })
+  // From anyone else it is plain text: a post in a present topic, nothing more.
+  expect(classifyUpdate(grp('@everyone', 40, STRANGER), e)).toMatchObject({ action: 'deliver', why: 'group' })
+  expect(classifyUpdate(grp('morning', 40), e)).toMatchObject({ action: 'deliver', why: 'group' })
+  expect(e.access).toEqual(OPEN_GROUP)
+})
+
+test("everyone D18: end to end, @everyone in an absent topic is confirmed and the one in a present topic exits 10 unconfirmed", async () => {
+  const absent = grp('@everyone status?', 77)
+  const present = grp('@everyone status?', 40)
+  const f = fixture(OPEN_GROUP)
+  const s = startStub([absent, present])
+  const r = await runWake(f.home, s.url)
+  expect(r.rc).toBe(EXIT.DELIVER)
+  expect(r.out).toContain(`deliverable update ${present.update_id} (everyone), ack sent; 1 dropped and confirmed`)
+  expect(s.pending.map(u => u.update_id)).toEqual([present.update_id])
+  expect(sends(s).map(c => [c.body.text, c.body.message_thread_id])).toEqual([[ACK_TEXT, 40]])
+  expect(lines(f.teeFile).filter(l => l.dir === 'in').map(l => [l.text, l.delivered])).toEqual([['@everyone status?', false]])
+  expect(JSON.parse(readFileSync(join(f.home, '.claude', 'channels', 'telegram-testy', 'access.json'), 'utf8'))).toEqual(OPEN_GROUP)
+})
+
 test("wake classify: a stranger's DM is a drop under every dmPolicy, and disabled drops Monty too", () => {
   const pairing: GateAccess = { ...ACCESS, dmPolicy: 'pairing' }
   expect(classifyUpdate(dm('hi', STRANGER), env(pairing))).toMatchObject({ action: 'drop', why: 'pairing' })
