@@ -70,6 +70,8 @@ edit-telegram-access Vera group-remove -1001654782309
 
 **A mention from you is an invite.** In a forum topic the bot is absent from, a mention of it (its `@username`, its name, a `mentionPatterns` match, or a reply to its message) from a sender in the top-level `allowFrom` does what `/invite` does: the thread entry is set to `requireMention: false`, the bridge posts its arrival line, the session gets the `command="invite"` event, and then the message itself is delivered. A mention from anyone else is delivered and changes nothing. It needs the group to have an entry already, and a bridge in static mode applies nothing.
 
+**Present bots hear each other from the post log.** Telegram does not hand one bot another bot's post, so a bridge that is present in a topic (thread entry `requireMention: false`) reads the other fleet bots' posts there from the post log, through `tail-fleet-posts`, and delivers each to its session once, marked `via="post-log"`. It reads only the record the posting bot wrote itself, never its own posts, and nothing in a topic it is absent from: there a peer's tag still arrives by the tag relay and nothing else does. At most 6 posts per hour reach one bot from one peer; past that a post is logged as skipped. While either host's log cannot be read nothing is delivered, and the bridge says so once on stderr. A post reaches the session within about 10 seconds.
+
 ```
 edit-telegram-access Vera thread -1001654782309 39 --require-mention
 edit-telegram-access Vera thread -1001654782309 39 --no-require-mention

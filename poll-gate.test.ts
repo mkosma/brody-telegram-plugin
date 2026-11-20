@@ -6,9 +6,10 @@
 // client over stdio, and a local stub stands in for the Telegram API.
 
 import { test, expect, afterAll, setDefaultTimeout } from 'bun:test'
-import { mkdtempSync } from 'fs'
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { TAIL_FLEET_POSTS_BIN } from './peer-posts.ts'
 
 // Subprocesses, and revert-proofs.py runs the whole suite under load.
 setDefaultTimeout(30_000)
@@ -45,8 +46,9 @@ function startStub() {
   return { url: `http://127.0.0.1:${server.port}`, calls, methods: () => calls.map(c => c.method) }
 }
 
-function startBridge(apiRoot: string, env: Record<string, string> = {}) {
+function startBridge(apiRoot: string, env: Record<string, string> | ((home: string) => Record<string, string>) = {}) {
   const home = mkdtempSync(join(tmpdir(), 'poll-gate-'))
+  if (typeof env === 'function') env = env(home)
   const spawnedAt = Date.now()
   const p = Bun.spawn(['bun', join(import.meta.dir, 'server.ts')], {
     env: {
@@ -72,7 +74,10 @@ function startBridge(apiRoot: string, env: Record<string, string> = {}) {
   void pump(p.stderr, s => { err += s })
   return {
     spawnedAt,
+    home,
     stderr: () => err,
+    // Every JSON-RPC notification of this method the server has written so far.
+    notifications: (method: string) => out.split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(m => m.method === method),
     send: (msg: object) => { p.stdin.write(JSON.stringify(msg) + '\n'); p.stdin.flush() },
     // The JSON-RPC response with this id, once the server has written it.
     response: (id: number) => until(() => out.split('\n').filter(Boolean).map(l => JSON.parse(l)).find(m => m.id === id)),
@@ -139,4 +144,59 @@ test('poll gate: the bound defaults to 30s, the client\'s own MCP connect timeou
   // The callback is set before connect(), or an early initialized is missed.
   expect(src.indexOf('mcp.oninitialized =')).toBeGreaterThan(-1)
   expect(src.indexOf('mcp.oninitialized =')).toBeLessThan(src.indexOf('await mcp.connect('))
+})
+
+// SPEC-bridge-presence-by-invite-2026-11-19, amendment C, end to end: the real
+// server.ts, the real tail-fleet-posts, and a peer's post that exists only as
+// a line in the other host's post log. The stub API never delivers it. The
+// reader's test hooks point it at directories under the test's own temp home,
+// so no ssh runs and no live post log is read or written.
+test('peer posts, end to end: a peer\'s logged post in a present topic reaches the session once, within 10s, and one in an absent topic never does', async () => {
+  const GROUP = '-1004286764447'
+  const stub = startStub()
+  const bridge = startBridge(stub.url, home => {
+    mkdirSync(join(home, 'state'), { recursive: true })
+    mkdirSync(join(home, 'mini'))
+    // Mention-only at the group level, present in thread 40 only.
+    writeFileSync(join(home, 'state', 'access.json'), JSON.stringify({
+      dmPolicy: 'allowlist', allowFrom: ['111'], pending: {},
+      groups: { [GROUP]: { requireMention: true, allowFrom: [], threads: { '40': { requireMention: false } } } },
+    }))
+    return {
+      TELEGRAM_TEE_DIR: join(home, 'tee'),
+      TAIL_FLEET_POSTS_BIN,
+      TAIL_FLEET_POSTS_HOST: 'maxi',
+      TAIL_FLEET_POSTS_DIR: join(home, 'tee'),
+      TAIL_FLEET_POSTS_READ_MINI: `${TAIL_FLEET_POSTS_BIN} --dump ${join(home, 'mini')}`,
+    }
+  })
+  bridge.send(INITIALIZE)
+  await bridge.response(1)
+  bridge.send(INITIALIZED)
+  await until(() => bridge.stderr().includes(`polling as @${BOT}`))
+
+  const post = (message_id: number, thread_id: number, text: string) =>
+    appendFileSync(join(bridge.home, 'mini', 'MK_MayaBot.jsonl'), JSON.stringify({
+      ts: new Date().toISOString(), dir: 'out', chat_id: GROUP, thread_id, message_id, reply_to: null, text, edit: false, bot: 'MK_MayaBot',
+    }) + '\n')
+  const peers = () => bridge.notifications('notifications/claude/channel').filter(n => n.params.meta.via === 'post-log')
+
+  post(7002, 77, 'in a topic Testy was never invited to')
+  post(7001, 40, 'now playing: Scientist')
+  const postedAt = Date.now()
+  const first = await until(() => peers()[0], 10_000)
+  expect(Date.now() - postedAt).toBeLessThan(10_000)
+  expect(first.params).toEqual({
+    content: 'now playing: Scientist',
+    meta: { chat_id: GROUP, message_id: '7001', message_thread_id: '40', user: 'MK_MayaBot', ts: expect.any(String), via: 'post-log' },
+  })
+  // Another round re-reads the same lines: still one delivery, and nothing from thread 77.
+  await Bun.sleep(6_500)
+  expect(peers().map(n => n.params.meta.message_id)).toEqual(['7001'])
+  // The bridge recorded the delivery in its own log and posted nothing to Telegram.
+  const own = readFileSync(join(bridge.home, 'tee', `${BOT}.jsonl`), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+  expect(own).toEqual([expect.objectContaining({ dir: 'in', message_id: 7001, from_user: 'MK_MayaBot', delivered: true, via: 'post-log', bot: BOT })])
+  expect(stub.methods().filter(m => m.startsWith('send'))).toEqual([])
+  expect(bridge.stderr()).not.toContain('post log unreadable')
+  bridge.kill()
 })

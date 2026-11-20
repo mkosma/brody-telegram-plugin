@@ -1426,3 +1426,266 @@ test('presence D6: who-hears and the gate agree on who is present', () => {
   const forum = (key: string) => settings[cases.findIndex(c => c.name === 'group false' && c.forum && c.key === key)]
   expect([forum('40'), forum('333'), forum('77'), forum('general')]).toEqual(['hears everything', 'excused here', 'only when tagged', 'only when tagged'])
 })
+
+// --- SPEC-bridge-presence-by-invite-2026-11-19, amendment C ----------------------
+// A present bot is delivered every other fleet bot's post in the topic from
+// the post log. Drills D7-D12. Nothing here reaches Telegram, a session, a
+// dispatch or a live post log: notify and the tee are arrays, and the reader
+// is either a canned run or, in D12, the real tail-fleet-posts pointed at
+// fixture directories by its own test hooks (no ssh, no ~/.agents).
+
+import { homedir } from 'os'
+import { RELAY_MAX_PER_HOUR } from './tag-relay.ts'
+import { SeenPosts, deliverPeerPosts, pollPeerPosts, postKey, PEER_POLL_MS, PEER_READ_TIMEOUT_MS, PEER_LOOKBACK_MS, PEER_OVERLAP_MS, PEER_READ_MAX_CHARS, TAIL_FLEET_POSTS_BIN, type PeerDeps, type PeerEvent, type PeerRecord } from './peer-posts.ts'
+
+const T0 = Date.parse('2026-11-20T08:00:00Z')
+const peerOut = (bot: string, message_id: number, thread: number | null, text = `post ${message_id}`, extra: Partial<PeerRecord> = {}): PeerRecord =>
+  ({ ts: new Date(T0).toISOString(), dir: 'out', chat_id: GROUP, thread_id: thread, message_id, reply_to: null, text, edit: false, bot, ...extra })
+
+/** One bridge: presence() access (40 invited, 333 excused, 77 never entered), a clock, and a canned log. */
+function peerRig(opts: { own?: string; file?: string; clock?: { t: number } } = {}) {
+  const clock = opts.clock ?? { t: T0 }
+  const now = () => clock.t
+  const events: PeerEvent[] = []
+  const logged: Array<Record<string, unknown>> = []
+  const lines: string[] = []
+  const runs: Array<{ argv: string[]; timeoutMs: number }> = []
+  const log: { records: PeerRecord[]; rc: number } = { records: [], rc: 0 }
+  const deps: PeerDeps = {
+    ownBot: () => opts.own ?? 'MK_GradyBot',
+    groups: () => presence().groups,
+    seen: new SeenPosts(opts.file, now, undefined, l => lines.push(l)),
+    limiter: new RelayLimiter(RELAY_MAX_PER_HOUR, now),
+    notify: e => events.push(e),
+    tee: e => logged.push(e),
+    run: async (argv, timeoutMs) => {
+      runs.push({ argv, timeoutMs })
+      return { rc: log.rc, stdout: log.records.map(r => JSON.stringify(r)).join('\n') + '\n', stderr: log.rc ? 'mini: UNREADABLE (timeout)\n' : '' }
+    },
+    now,
+    stderr: l => lines.push(l),
+    bin: '/fixture/tail-fleet-posts',
+  }
+  return { deps, events, logged, lines, runs, log, clock }
+}
+
+test("peer posts D7: a peer's post in a present topic is delivered exactly once, across re-reads and a restart", async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'peer-seen-')), 'peer-posts.json')
+  const g = peerRig({ file })
+  g.log.records = [peerOut('MK_MayaBot', 901, 40, 'now playing: Scientist')]
+  expect(await pollPeerPosts(g.deps)).toEqual([{ key: `${GROUP}:901`, bot: 'MK_MayaBot', delivered: true }])
+  expect(g.events).toEqual([{
+    content: 'now playing: Scientist',
+    meta: { chat_id: GROUP, message_id: '901', message_thread_id: '40', user: 'MK_MayaBot', ts: new Date(T0).toISOString(), via: 'post-log' },
+  }])
+  // The delivery is on this bridge's own record, marked as read from the log.
+  expect(g.logged).toEqual([expect.objectContaining({ dir: 'in', chat_id: GROUP, thread_id: 40, message_id: 901, from_user: 'MK_MayaBot', from_is_bot: true, delivered: true, via: 'post-log' })])
+  // The reader is tail-fleet-posts, asked for JSON from just behind the cursor.
+  expect(g.runs).toEqual([{ argv: ['/fixture/tail-fleet-posts', '--json', '--since', new Date(T0 - PEER_OVERLAP_MS).toISOString()], timeoutMs: PEER_READ_TIMEOUT_MS }])
+  // Every later round re-reads the overlap, and an edit is the same post.
+  g.clock.t += PEER_POLL_MS
+  g.log.records.push(peerOut('MK_MayaBot', 901, 40, 'now playing: Scientist (edited)', { edit: true }))
+  expect(await pollPeerPosts(g.deps)).toEqual([])
+  expect(await pollPeerPosts(g.deps)).toEqual([])
+  expect(g.events.length).toBe(1)
+  // A restart: a new bridge on the same state file delivers nothing again,
+  // and reads on from where the last one stopped.
+  const again = peerRig({ file, clock: { t: T0 + 60_000 } })
+  again.log.records = g.log.records
+  expect(again.deps.seen.cursor).toBe(T0 + PEER_POLL_MS)
+  expect(await pollPeerPosts(again.deps)).toEqual([])
+  expect(again.events).toEqual([])
+  // A post made while it was down is delivered; one from before its reach is not asked for.
+  again.log.records = [...g.log.records, peerOut('MK_MayaBot', 902, 40)]
+  expect((await pollPeerPosts(again.deps))!.map(o => o.key)).toEqual([`${GROUP}:902`])
+  const late = peerRig({ file, clock: { t: T0 + 3 * 60 * 60_000 } })
+  await pollPeerPosts(late.deps)
+  expect(late.runs[0].argv[3]).toBe(new Date(T0 + 3 * 60 * 60_000 - PEER_LOOKBACK_MS - PEER_OVERLAP_MS).toISOString())
+  // No state file is a first start: the cursor is now, so no history is delivered.
+  expect(new SeenPosts(join(tmpdir(), 'no-such-peer-state.json'), () => T0).cursor).toBe(T0)
+})
+
+test('peer posts D8: an absent topic gets nothing from the log, whatever the group level', async () => {
+  const g = peerRig()
+  // Group level false; 77 never entered, 333 excused, General not entered, and a group not in access at all.
+  g.log.records = [
+    peerOut('MK_MayaBot', 911, 77),
+    peerOut('MK_MayaBot', 912, 333),
+    peerOut('MK_MayaBot', 913, null),
+    peerOut('MK_MayaBot', 914, 40, 'elsewhere', { chat_id: '-100999' }),
+    peerOut('MK_MayaBot', 915, 77, '@grady look at this'),
+  ]
+  expect(await pollPeerPosts(g.deps)).toEqual([])
+  expect(g.events).toEqual([])
+  expect(g.logged).toEqual([])
+  expect(g.lines).toEqual([])
+  // Nothing was taken either: absent is not "seen".
+  expect(g.deps.seen.has(postKey(GROUP, 911))).toBe(false)
+  // The same posts in the invited topic are delivered: the topic decided, not the post.
+  expect(deliverPeerPosts(g.deps, [peerOut('MK_MayaBot', 916, 40)]).length).toBe(1)
+})
+
+test('peer posts D9: a post Telegram already delivered is not delivered again from the log, in either order', async () => {
+  // Telegram first (Vera's bot receives peers natively): handleInbound takes the key.
+  const g = peerRig({ own: 'MK_VeraBot' })
+  expect(g.deps.seen.take(postKey(Number(GROUP), 921))).toBe(true)
+  g.log.records = [peerOut('MK_MayaBot', 921, 40), peerOut('MK_MayaBot', 922, 40)]
+  expect((await pollPeerPosts(g.deps))!.map(o => o.key)).toEqual([`${GROUP}:922`])
+  expect(g.events.map(e => e.meta.message_id)).toEqual(['922'])
+  // The log first: when Telegram's copy arrives, the key is already taken.
+  expect(g.deps.seen.take(postKey(Number(GROUP), 922))).toBe(false)
+
+  // The server: a bot's group post takes the key after the gate has decided,
+  // and a delivery that is not the first sight stops there.
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf('async function handleInbound(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const gateAt = body.indexOf('const result = teeInbound(teeArgs, () => gate(ctx))')
+  const peer = body.indexOf('const peerPost = ctx.from?.is_bot === true && ctx.chat != null && isGroupChatId(ctx.chat.id) && ctx.message?.message_id != null')
+  const take = body.indexOf('const firstSight = !peerPost || peerSeen.take(postKey(ctx.chat!.id, ctx.message!.message_id))')
+  const stop = body.indexOf("if (result.action === 'deliver' && !firstSight) return")
+  const deliver = body.indexOf("method: 'notifications/claude/channel',", stop)
+  expect(gateAt).toBeGreaterThan(-1)
+  expect(peer).toBeGreaterThan(gateAt)
+  expect(take).toBeGreaterThan(peer)
+  expect(stop).toBeGreaterThan(take)
+  expect(deliver).toBeGreaterThan(stop)
+  // One set, shared by both paths and kept in the state dir.
+  expect(src).toContain("const peerSeen = new SeenPosts(join(STATE_DIR, 'peer-posts.json'))")
+  expect(src).toContain('  seen: peerSeen,\n')
+})
+
+test('peer posts D10: the 7th delivery in an hour from one peer is skipped and logged, once, per pair', async () => {
+  const g = peerRig()
+  g.log.records = [1, 2, 3, 4, 5, 6, 7].map(i => peerOut('MK_MayaBot', 930 + i, 40))
+  const first = (await pollPeerPosts(g.deps))!
+  expect(first.map(o => o.delivered)).toEqual([true, true, true, true, true, true, false])
+  expect(first[6]).toEqual({ key: `${GROUP}:937`, bot: 'MK_MayaBot', delivered: false, skipped: 'rate' })
+  expect(g.events.map(e => e.meta.message_id)).toEqual(['931', '932', '933', '934', '935', '936'])
+  expect(g.lines).toEqual([`telegram channel: peer post MK_MayaBot -> MK_GradyBot skipped: over ${RELAY_MAX_PER_HOUR} deliveries in the last hour (${GROUP}:937)\n`])
+  expect(g.logged.length).toBe(7)
+  expect(g.logged[6]).toEqual(expect.objectContaining({ message_id: 937, delivered: false, skipped: 'rate', via: 'post-log' }))
+  expect(g.logged[5]).not.toHaveProperty('skipped')
+  // The bound is per pair: another peer's post still arrives.
+  g.log.records.push(peerOut('MK_WernerBot', 940, 40))
+  expect((await pollPeerPosts(g.deps))!).toEqual([{ key: `${GROUP}:940`, bot: 'MK_WernerBot', delivered: true }])
+  // The skipped post is not delivered later, and says nothing again.
+  g.clock.t += 61 * 60_000
+  g.log.records.push(peerOut('MK_MayaBot', 941, 40))
+  expect((await pollPeerPosts(g.deps))!).toEqual([{ key: `${GROUP}:941`, bot: 'MK_MayaBot', delivered: true }])
+  expect(g.events.map(e => e.meta.message_id)).not.toContain('937')
+  expect(g.lines.length).toBe(1)
+})
+
+test("peer posts D11: a bot's own post is never delivered back to it, and a bridge that does not know its name delivers nothing", async () => {
+  const g = peerRig({ own: 'MK_GradyBot' })
+  g.log.records = [peerOut('MK_GradyBot', 951, 40), peerOut('mk_gradybot', 952, 40), peerOut('MK_MayaBot', 953, 40)]
+  expect((await pollPeerPosts(g.deps))!.map(o => o.key)).toEqual([`${GROUP}:953`])
+  expect(g.events.map(e => e.meta.user)).toEqual(['MK_MayaBot'])
+  expect(g.logged.map(e => e.message_id)).toEqual([953])
+  // Only the posting bot's own record is a post: what another bot received is not one.
+  expect(deliverPeerPosts(g.deps, [{ ...peerOut('MK_VeraBot', 954, 40), dir: 'in' }, { ...peerOut('', 955, 40), bot: undefined }])).toEqual([])
+  // Before polling starts the username is '': it cannot tell its own posts, so it reads and delivers nothing.
+  const unnamed = peerRig({ own: '' })
+  unnamed.log.records = g.log.records
+  expect(deliverPeerPosts(unnamed.deps, unnamed.log.records)).toEqual([])
+  expect(await pollPeerPosts(unnamed.deps)).toEqual([])
+  expect(unnamed.runs).toEqual([])
+  expect(unnamed.events).toEqual([])
+})
+
+// D12 runs the real tail-fleet-posts (monty-ops, the one reader of both hosts)
+// against two fixture directories standing for maxi's and mini's logs. Its own
+// test hooks name this host, its directory, and the command that reads the
+// other host, so no ssh runs and no live log is read.
+function twoHosts() {
+  const base = mkdtempSync(join(tmpdir(), 'peer-hosts-'))
+  const dirs = { maxi: join(base, 'maxi'), mini: join(base, 'mini') }
+  realFs.mkdirSync(dirs.maxi)
+  realFs.mkdirSync(dirs.mini)
+  const ts = new Date().toISOString()
+  fsWrite(join(dirs.maxi, 'MK_GradyBot.jsonl'), JSON.stringify({ ...peerOut('MK_GradyBot', 961, 40, 'Grady, from maxi'), ts }) + '\n')
+  fsWrite(join(dirs.mini, 'MK_MayaBot.jsonl'), JSON.stringify({ ...peerOut('MK_MayaBot', 962, 40, 'Maya, from mini'), ts }) + '\n')
+  const runAs = (host: 'maxi' | 'mini', readOther?: string): OutputRunner => async (argv, timeoutMs) => {
+    const other = host === 'maxi' ? 'mini' : 'maxi'
+    const r = spawnSync(argv[0], argv.slice(1), {
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      env: {
+        PATH: '/usr/bin:/bin',
+        TAIL_FLEET_POSTS_HOST: host,
+        TAIL_FLEET_POSTS_DIR: dirs[host],
+        [`TAIL_FLEET_POSTS_READ_${other.toUpperCase()}`]: readOther ?? `${TAIL_FLEET_POSTS_BIN} --dump ${dirs[other]}`,
+      },
+    })
+    return { rc: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
+  }
+  const bridge = (own: string, run: OutputRunner) => {
+    const clock = { t: Date.now() }
+    const g = peerRig({ own, clock })
+    g.deps.run = run
+    g.deps.bin = undefined
+    return g
+  }
+  return { runAs, bridge }
+}
+
+test('peer posts D12: a post by Maya on mini reaches a bot on maxi, and a post from maxi reaches Maya on mini', async () => {
+  expect(TAIL_FLEET_POSTS_BIN).toBe(join(homedir(), '.local', 'bin', 'tail-fleet-posts'))
+  expect(existsSync(TAIL_FLEET_POSTS_BIN)).toBe(true)
+  const h = twoHosts()
+  const grady = h.bridge('MK_GradyBot', h.runAs('maxi'))
+  expect(await pollPeerPosts(grady.deps)).toEqual([{ key: `${GROUP}:962`, bot: 'MK_MayaBot', delivered: true }])
+  expect(grady.events.map(e => [e.meta.user, e.content])).toEqual([['MK_MayaBot', 'Maya, from mini']])
+  const maya = h.bridge('MK_MayaBot', h.runAs('mini'))
+  expect(await pollPeerPosts(maya.deps)).toEqual([{ key: `${GROUP}:961`, bot: 'MK_GradyBot', delivered: true }])
+  expect(maya.events.map(e => [e.meta.user, e.content])).toEqual([['MK_GradyBot', 'Grady, from maxi']])
+})
+
+test('peer posts D12: while the other host cannot be read nothing is delivered and it is said once; the next good read delivers', async () => {
+  const h = twoHosts()
+  const g = h.bridge('MK_GradyBot', h.runAs('maxi', '/usr/bin/false'))
+  const cursor = g.deps.seen.cursor
+  expect(await pollPeerPosts(g.deps)).toBeUndefined()
+  expect(await pollPeerPosts(g.deps)).toBeUndefined()
+  expect(g.events).toEqual([])
+  expect(g.deps.seen.cursor).toBe(cursor)
+  expect(g.lines.length).toBe(1)
+  expect(g.lines[0]).toStartWith('telegram channel: post log unreadable, no peer posts delivered until it reads again: rc=3 mini: UNREADABLE')
+  g.deps.run = h.runAs('maxi')
+  g.clock.t += PEER_POLL_MS
+  expect((await pollPeerPosts(g.deps))!.map(o => o.key)).toEqual([`${GROUP}:962`])
+  expect(g.lines[1]).toBe('telegram channel: post log reads again\n')
+  expect(g.deps.seen.cursor).toBe(cursor + PEER_POLL_MS)
+})
+
+test('peer posts: the server polls the log only after initialized, every 5s, through the shared reader, and tells the agent what a peer post is', () => {
+  // 5s between rounds and tail-fleet-posts' own 5s bound on a host: 10s from post to delivery.
+  expect(PEER_POLL_MS).toBeLessThanOrEqual(5000)
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const init = src.indexOf('if (!(await clientInitialized)) {')
+  const loop = src.indexOf('  void peerPostLoop()\n')
+  const start = src.indexOf('await bot.start({')
+  expect(init).toBeGreaterThan(-1)
+  expect(loop).toBeGreaterThan(init)
+  expect(start).toBeGreaterThan(loop)
+  expect(src).toContain('      await pollPeerPosts(peerDeps)\n')
+  expect(src).toContain('    await new Promise(r => setTimeout(r, Math.max(0, PEER_POLL_MS - (Date.now() - started))))')
+  expect(src).toContain('  groups: () => loadAccess().groups,\n')
+  expect(src).toContain('  run: spawnOutput,\n  notify: event => {\n    mcp.notification({ method: \'notifications/claude/channel\', params: event })')
+  expect(src).toContain('via="post-log"')
+})
+
+test('peer posts: a busy read is kept whole, past the runner\'s default cap', async () => {
+  // The runner stops keeping output once it holds its cap, so a read that
+  // arrives in more than one piece loses everything after the first.
+  const big = ['/bin/sh', '-c', 'head -c 20000 /dev/zero | tr "\\0" x; sleep 0.3; head -c 200000 /dev/zero | tr "\\0" y']
+  expect((await spawnOutput(big, 5000)).stdout).not.toContain('y')
+  expect((await spawnOutput(big, 5000, PEER_READ_MAX_CHARS)).stdout.length).toBe(220000)
+  const g = peerRig()
+  let cap: number | undefined
+  g.deps.run = async (_argv, _timeoutMs, maxStdout) => { cap = maxStdout; return { rc: 0, stdout: '', stderr: '' } }
+  await pollPeerPosts(g.deps)
+  expect(cap).toBe(PEER_READ_MAX_CHARS)
+  expect(PEER_READ_MAX_CHARS).toBeGreaterThanOrEqual(1024 * 1024)
+})

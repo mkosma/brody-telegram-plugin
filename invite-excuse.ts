@@ -275,10 +275,10 @@ export async function sayGroupCommand(deps: Pick<CommandDeps, 'answer' | 'stderr
   }
 }
 
-export type OutputRunner = (argv: string[], timeoutMs: number) => Promise<{ rc: number; stdout: string; stderr: string }>
+export type OutputRunner = (argv: string[], timeoutMs: number, maxStdout?: number) => Promise<{ rc: number; stdout: string; stderr: string }>
 
-/** Run argv and keep its stdout. Resolves, never rejects: 127 when it cannot start, 124 when killed at the bound. */
-export const spawnOutput: OutputRunner = (argv, timeoutMs) =>
+/** Run argv and keep its stdout, up to maxStdout characters. Resolves, never rejects: 127 when it cannot start, 124 when killed at the bound. */
+export const spawnOutput: OutputRunner = (argv, timeoutMs, maxStdout = 16384) =>
   new Promise(resolve => {
     let stdout = ''
     let stderr = ''
@@ -292,7 +292,7 @@ export const spawnOutput: OutputRunner = (argv, timeoutMs) =>
       return
     }
     const timer = setTimeout(() => { child.kill('SIGKILL'); finish(RC_TIMEOUT) }, timeoutMs)
-    child.stdout?.on('data', d => { if (stdout.length < 16384) stdout += String(d) })
+    child.stdout?.on('data', d => { if (stdout.length < maxStdout) stdout += String(d) })
     child.stderr?.on('data', d => { if (stderr.length < 4096) stderr += String(d) })
     child.on('error', e => { stderr += String(e); finish(127) })
     child.on('close', code => finish(code ?? 1))
