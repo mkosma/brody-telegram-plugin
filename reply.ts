@@ -50,6 +50,27 @@ export type ReplyDeps = {
   relay?: (req: RelayRequest) => Promise<RelayOutcome[]> | undefined
   /** Test hook: handed the background work (relay, then log) when there is some. */
   settled?: (work: Promise<void>) => void
+  /** Told of each text message sent, so pin_message knows this bot's own posts (pin.ts). */
+  sent?: (post: { chat_id: string; thread_id: number | undefined; message_id: number; text: string }) => void
+}
+
+/** Bot API: CopyTextButton.text is 1-256 characters. */
+export const COPY_TEXT_MAX = 256
+
+/**
+ * Why a copy button's text is refused, or undefined when it is fine.
+ *
+ * The limit of 256 is Telegram's. One line is ours (Monty, 2026-11-21,
+ * Telegram msg 1855): a command handed to him is one line he can paste and
+ * run. A longer script goes in a file, and the button copies the one-line
+ * command that runs it.
+ */
+export function copyTextProblem(copy_text: unknown): string | undefined {
+  const text = (copy_text as { text?: unknown } | null)?.text
+  if (typeof text !== 'string' || text.length === 0) return 'copy_text needs a text to copy'
+  if (/[\r\n]/.test(text)) return 'it is more than one line'
+  if (text.length > COPY_TEXT_MAX) return `it is ${text.length} characters and the limit is ${COPY_TEXT_MAX}`
+  return undefined
 }
 
 // One record per message id Telegram gave back, in send order.
@@ -103,10 +124,17 @@ export async function runReply(
   // out of this type was half of why it never reached Telegram; the
   // keyboard construction below was the other half.
   const reply_markup = args.reply_markup as
-    | { inline_keyboard: Array<Array<{ text: string; callback_data: string; style?: 'primary' | 'success' | 'danger' }>> }
+    | { inline_keyboard: Array<Array<{ text: string; callback_data?: string; copy_text?: { text: string }; style?: 'primary' | 'success' | 'danger' }>> }
     | undefined
 
   deps.assertAllowedChat(chat_id)
+  // A copy button is checked before anything is sent, so a bad one fails the
+  // whole reply with its reason and never arrives as a button that copies nothing.
+  for (const btn of (reply_markup?.inline_keyboard ?? []).flat()) {
+    if (btn?.copy_text === undefined) continue
+    const problem = copyTextProblem(btn.copy_text)
+    if (problem) throw new Error(`copy button "${btn.text}" refused: ${problem}. A copy button copies one line of at most ${COPY_TEXT_MAX} characters; put a longer script in a file and copy the command that runs it.`)
+  }
   // The reply is going out now: stop the "is composing" typing keepalive.
   deps.stopTyping(chat_id)
 
@@ -168,6 +196,7 @@ export async function runReply(
           ...(chunkKeyboard ? { reply_markup: chunkKeyboard } : {}),
         })
         sentIds.push(sent.message_id)
+        try { deps.sent?.({ chat_id, thread_id: message_thread_id, message_id: sent.message_id, text: chunks[i] }) } catch {}
         posts.push({
           message_id: sent.message_id,
           text: chunks[i],

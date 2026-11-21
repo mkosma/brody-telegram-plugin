@@ -85,8 +85,15 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 | `edit_message` | Edit a message the bot previously sent. Useful for "working…" to result progress updates. Only works on the bot's own messages. |
 | `download_attachment` | (fork addition) Fetch a file by `file_id` from an inbound message and return its local path so the assistant can `Read` it. |
 | `create_forum_topic` | (fork addition) Create a forum topic in a supergroup (Bot API 9.4) and return its `message_thread_id`, so replies can be threaded into topics. |
+| `pin_message` | (fork addition) Pin the bot's own one-line question in its chat or topic. Refused for any other message, and for a second pin in the same topic. In a group it needs the admin right `can_pin_messages` and says so when it is missing. The bridge unpins it when the allowlisted user replies to it, taps one of its buttons or puts a 👍 on it; after 24 hours unanswered it is filed with `interrupt add --tier blocker`. |
+| `unpin_message` | (fork addition) Unpin a message this bot pinned. |
+| `list_pins` | (fork addition) List the pins this bot holds, from `pins.json` in its state dir. |
 
 Replies can also carry inline keyboard buttons (`reply_markup` with an `inline_keyboard` array); button taps arrive as `callback_query` events. The fork handles `open:<vault>:<path>` callbacks to open vault notes.
+
+A button may carry `copy_text: {"text": "..."}` in place of `callback_data` (Bot API 7.11): a tap copies the text and sends no callback. The text is one line of at most 256 characters, or the reply is refused.
+
+After a tap the bridge edits the message's keyboard: the chosen button becomes "✓ label" and the others are removed. A button that opens or shows something (`omf:`, `open:`, an alert's Show fix) is marked and the others stay. `pin-right-check.ts <Agent>` reports whether that agent's bot holds `can_pin_messages` in each of its groups.
 
 Inbound messages trigger a typing indicator automatically - Telegram shows
 "botname is typing…" while the assistant works on a response.

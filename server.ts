@@ -12,6 +12,9 @@
  *   - Feature 1: Topics support (Bot API 9.4) — message_thread_id in/out, create_forum_topic tool
  *   - Feature 2: Reactions support — message_reaction events surfaced as channel blocks
  *   - Feature 3: Inline keyboards — reply_markup on outbound, callback_query events for general use
+ *   - Pins: pin_message / unpin_message / list_pins, released on Monty's answer (pin.ts)
+ *   - Copy buttons: copy_text on an inline button (reply.ts)
+ *   - Button state: a tapped button is marked in the message's keyboard (button-state.ts)
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -43,6 +46,8 @@ import { runCreateForumTopic, runEditForumTopic } from './forum-topic.ts'
 import { openTapped, tappedLabel, type OmfTapDeps } from './omf-tap.ts'
 import { SeenPosts, PeerLimiter, montyPosted, pollPeerPosts, postKey, PEER_POLL_MS, type PeerDeps, type MontyDeps } from './peer-posts.ts'
 import { inboundContext, INBOUND_CONTEXT_CMD, type ContextDeps } from './inbound-context.ts'
+import { SentPosts, filePinStore, runPinMessage, runUnpinMessage, runListPins, releaseOnAnswer, sweepPins, PIN_SWEEP_MS, type PinDeps, type SweepDeps } from './pin.ts'
+import { markTapped, frozenToast, FROZEN_DATA, type Markup } from './button-state.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -420,6 +425,12 @@ const mcp = new Server(
       '',
       'To attach inline keyboard buttons to an outbound message, pass reply_markup with an inline_keyboard array. Each button needs text (label) and callback_data (a short string you choose). A button also takes an optional style: "primary" (blue), "success" (green) or "danger" (red). Set one - the default has no color and renders nearly invisible against a macOS dark theme, which is a complaint Monty has actually made. When Monty taps a button, a callback_query event arrives as <channel source="telegram" type="callback_query" chat_id="..." message_id="..." callback_data="..." user="..." ts="..."/>.',
       '',
+      'A button can copy text instead of calling back: give it copy_text: { text: "..." } in place of callback_data. Every command you hand Monty goes that way: ONE line of at most 256 characters, on a button labelled "Copy" with style "primary". A longer script goes in a file, and the button copies the one-line command that runs it. A copy tap sends you no event.',
+      '',
+      'After Monty taps a button, the bridge edits that message\'s keyboard: the chosen button becomes "✓ <label>" and the others are removed, so the choice is frozen and stays visible. A button that opens or shows something is marked the same way and the other buttons stay. You still receive the callback_query event. If he changes his mind, that is a new message with new buttons; do not expect a second tap on the old one.',
+      '',
+      'pin_message pins ONE message: your own one-line question to Monty, in the topic where the work is, and only a question that is his call (money, his name, something hard to undo, his taste). One pin per topic at a time. Whoever pins, unpins: the bridge unpins it when he replies to that message, taps one of its buttons or puts a 👍 on it; if he answers any other way, call unpin_message yourself. list_pins shows the pins this bot holds, including after a restart. A pin unanswered for 24 hours is filed with Page.',
+      '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
       'In a group, Monty can open a topic to you with /invite and close it with /excuse. The bridge applies it and answers him in the topic itself; you are told as a <channel ... command="invite"|"excuse" thread_key="..."> event, where thread_key is the topic\'s message_thread_id or "general". Do not answer it again. On an invite, read the topic with `tail-fleet-posts --thread <id> --since 24h` before you answer; you were not following it. A mention from Monty in a topic you are not present in invites you the same way: the invite event comes first, then the message that mentioned you as its own event, and that one is yours to answer.',
@@ -473,6 +484,24 @@ mcp.setNotificationHandler(
   },
 )
 
+// Pins (pin.ts): this session's own sends, and the pin record in the state dir.
+const sentPosts = new SentPosts()
+const pinDeps: PinDeps & SweepDeps = {
+  api: bot.api,
+  assertAllowedChat,
+  sent: sentPosts,
+  store: filePinStore(join(STATE_DIR, 'pins.json')),
+  stderr: s => process.stderr.write(s),
+  run: spawnOutRunner,
+  agent: ACCESS_AGENT,
+}
+// His answer to a pinned message takes the pin down. Never awaited by a handler.
+const answered = (from: number | string | undefined, chat_id: string | number | undefined, message_id: number | undefined, how: 'reply' | 'tap' | 'thumbs-up'): void => {
+  if (from == null || chat_id == null || message_id == null) return
+  if (!loadAccess().allowFrom.includes(String(from))) return
+  void releaseOnAnswer(pinDeps, { chat_id: String(chat_id), message_id, how })
+}
+
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
@@ -494,7 +523,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           reply_markup: {
             type: 'object',
-            description: 'Inline keyboard to attach. Pass an inline_keyboard array of button rows. Each button needs text (label) and callback_data (short identifier string, max 64 bytes). When the user taps a button a callback_query event arrives as a channel block.',
+            description: 'Inline keyboard to attach. Pass an inline_keyboard array of button rows. Each button needs text (label) and either callback_data (short identifier string, max 64 bytes) or copy_text. When the user taps a callback button a callback_query event arrives as a channel block.',
             properties: {
               inline_keyboard: {
                 type: 'array',
@@ -504,7 +533,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
                     type: 'object',
                     properties: {
                       text: { type: 'string', description: 'Button label' },
-                      callback_data: { type: 'string', description: 'Data sent back when tapped (max 64 bytes)' },
+                      callback_data: { type: 'string', description: 'Data sent back when tapped (max 64 bytes). A button carries callback_data or copy_text, not both.' },
+                      // Bot API 7.11 (2024-10-31). Declared for the same reason as
+                      // `style` below: an undeclared field is one a caller
+                      // validating against this schema drops without a word.
+                      copy_text: {
+                        type: 'object',
+                        description: 'Makes this a copy button: a tap copies the text to his clipboard and sends no callback. One line, at most 256 characters; the reply is refused otherwise.',
+                        properties: { text: { type: 'string', description: 'The text to copy: one line, 1-256 characters' } },
+                        required: ['text'],
+                      },
                       // DECLARED SO IT SURVIVES THE TRIP, not for documentation.
                       // Bot API 9.4 (2026-02-09) added `style`; grammy 1.41.1
                       // types it, and the MCP SDK carries nested argument values
@@ -525,7 +563,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
                         description: 'Button color: primary (blue), success (green), danger (red). Omit for the app default, which renders near-transparent on macOS. Clients older than 2026-02-09 show the button unstyled rather than failing.',
                       },
                     },
-                    required: ['text', 'callback_data'],
+                    required: ['text'],
                   },
                 },
               },
@@ -614,6 +652,35 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'message_thread_id', 'name'],
       },
     },
+    {
+      name: 'pin_message',
+      description: 'Pin your own one-line question to Monty, to bring it to his attention in the topic where the work is. Refused unless the message is one this bot sent in this session, is one line and asks a question, and this bot has no other pin in that topic. Pin only a question that is his call. It is yours to take down: the bridge unpins it when he replies to it, taps one of its buttons or puts a 👍 on it; otherwise call unpin_message. In a group it works only from a bot that is an admin with the can_pin_messages right, and says so when the right is missing.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          message_id: { type: 'string', description: 'The id the reply tool returned for your question' },
+        },
+        required: ['chat_id', 'message_id'],
+      },
+    },
+    {
+      name: 'unpin_message',
+      description: 'Unpin a message this bot pinned with pin_message. Call it when Monty has answered the question in a way the bridge did not see (anything but a reply to the message, a tap on its buttons or a 👍 on it), or when the question no longer stands.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          message_id: { type: 'string' },
+        },
+        required: ['chat_id', 'message_id'],
+      },
+    },
+    {
+      name: 'list_pins',
+      description: 'List the pins this bot holds: chat, topic, message id, when it was pinned and the question. Read from the record in the bot\'s state dir, so it is right after a restart.',
+      inputSchema: { type: 'object', properties: {} },
+    },
   ],
 }))
 
@@ -623,7 +690,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     switch (req.params.name) {
       case 'reply':
         return await runReply(
-          { api: bot.api, loadAccess, assertAllowedChat, assertSendable, stopTyping, tee, relay },
+          { api: bot.api, loadAccess, assertAllowedChat, assertSendable, stopTyping, tee, relay, sent: p => sentPosts.note(p.chat_id, p.message_id, { text: p.text, thread_id: p.thread_id }) },
           args,
         )
       case 'react': {
@@ -658,6 +725,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return await runCreateForumTopic({ api: bot.api, assertAllowedChat, isStatic: STATIC, loadAccess, saveAccess }, args)
       case 'edit_forum_topic':
         return await runEditForumTopic({ api: bot.api, assertAllowedChat }, args)
+      case 'pin_message':
+        return await runPinMessage(pinDeps, args)
+      case 'unpin_message':
+        return await runUnpinMessage(pinDeps, args)
+      case 'list_pins':
+        return runListPins(pinDeps)
       default:
         return {
           content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }],
@@ -821,6 +894,24 @@ bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   const permMatch = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
 
+  // Button state (button-state.ts). The tapped message's keyboard as it is
+  // now, and the edit that marks the tap in it.
+  const tappedMarkup: Markup = ctx.callbackQuery.message && 'reply_markup' in ctx.callbackQuery.message
+    ? ctx.callbackQuery.message.reply_markup as Markup
+    : undefined
+  const markTap = () => markTapped(
+    { edit: m => ctx.editMessageReplyMarkup({ reply_markup: m as never }), stderr: s => process.stderr.write(s) },
+    tappedMarkup, data,
+  )
+  // A frozen button: the choice was made. Answered here, handed to nobody.
+  if (data === FROZEN_DATA) {
+    await ctx.answerCallbackQuery({ text: frozenToast(tappedMarkup) }).catch(() => {})
+    return
+  }
+
+  // A tap on a pinned question's button is his answer to it (pin.ts).
+  answered(ctx.from.id, ctx.callbackQuery.message?.chat.id, ctx.callbackQuery.message?.message_id, 'tap')
+
   // An alert's button, or an aged wait's. Served here, like omf:, so the tap
   // is answered whether or not this agent's session is alive: the command the
   // tap runs holds the alert, and its answer says what to show him.
@@ -839,6 +930,7 @@ bot.on('callback_query:data', async ctx => {
     })
     await ctx.answerCallbackQuery({ text: served.toast }).catch(() => {})
     void served.after
+    if (served.ok) void markTap()
     return
   }
 
@@ -934,6 +1026,7 @@ bot.on('callback_query:data', async ctx => {
     // ACKNOWLEDGE FIRST, THEN DO THE WORK. Monty asked for feedback that the
     // click landed; the toast is the feedback and it must not wait on obsidian.
     await ctx.answerCallbackQuery({ text: `Opening ${target.split('/').pop()}` }).catch(() => {})
+    void markTap()
     // --clicked: a tap IS the click, so this is mode (a) - the document goes
     // into the ACTIVE tab and Obsidian comes forward. Without it the script
     // probes, and a tap made while he is working in Obsidian would open the
@@ -991,6 +1084,7 @@ bot.on('callback_query:data', async ctx => {
       if (err) process.stderr.write(`open-callback failed: ${err.message} ${stderr}\n`)
     })
     await ctx.answerCallbackQuery({ text: `Opening ${path.split('/').pop()}` }).catch(() => {})
+    void markTap()
     return
   }
 
@@ -1041,6 +1135,9 @@ bot.on('callback_query:data', async ctx => {
   clearTimeout(timer)
   const toast = tapToast(outcome, ACCESS_AGENT, data, ctx.callbackQuery.message?.reply_markup)
   await ctx.answerCallbackQuery({ text: toast }).catch(() => {})
+  // Freeze the choice, unless the hand-off failed: a tap that reached nobody
+  // must stay tappable.
+  if (outcome !== 'rejected') await markTap()
 })
 
 // Feature 2: Reactions — surface as channel events so Claude can treat 👍/👎
@@ -1074,6 +1171,8 @@ bot.on('message_reaction', async ctx => {
   ]
 
   for (const { emoji, action } of events) {
+    // A thumbs-up on a pinned question is his answer to it (pin.ts).
+    if (emoji === '👍' && action === 'added') answered(userId, chat_id, msgId, 'thumbs-up')
     // A thumbs-down on an alert in one of Page's two alert topics goes to
     // Grady as one dispatch, from the bridge, and is not also handed to the
     // session: the hand-off must not depend on a turn, and must happen once.
@@ -1277,6 +1376,10 @@ async function handleInbound(
   if (ctx.chat && 'title' in ctx.chat && ctx.chat.title) groupTitles.set(String(ctx.chat.id), ctx.chat.title)
 
   const teeArgs = { message: ctx.message, chat: ctx.chat, from: ctx.from, text, tee }
+
+  // His reply to a pinned question is his answer to it (pin.ts). Before the
+  // gate: the pin comes down however the topic is gated.
+  answered(ctx.from?.id, ctx.chat?.id, ctx.message?.reply_to_message?.message_id, 'reply')
 
   // /invite, /excuse and /who are handled before gate(): a bot hears them
   // however the topic is gated. A command this bridge does nothing about is dropped,
@@ -1496,6 +1599,10 @@ void (async () => {
   if (shuttingDown) return
   // After initialized, like the poll: a peer post is a notification too.
   void peerPostLoop()
+  // Pins: retry a release that failed, and file a 24h pin with Page (pin.ts).
+  const pinSweep = () => { void sweepPins(pinDeps).catch(err => process.stderr.write(`pin: sweep failed: ${err}\n`)) }
+  pinSweep()
+  setInterval(pinSweep, PIN_SWEEP_MS).unref()
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({

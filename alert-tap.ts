@@ -137,12 +137,13 @@ function clip(s: string, max: number): string {
 }
 
 /**
- * Serve one tap. Returns the toast for answerCallbackQuery; never rejects.
+ * Serve one tap. Returns the toast for answerCallbackQuery and whether the
+ * command said the tap took; never rejects.
  * The toast is returned BEFORE any follow-up post is awaited by the caller:
  * `after` is the follow-up work (the fix reply, the talk post), which the
  * caller runs without making him wait on it.
  */
-export async function serveAlertTap(deps: AlertTapDeps, tap: AlertTap, msg: TappedMessage): Promise<{ toast: string; after: Promise<void> }> {
+export async function serveAlertTap(deps: AlertTapDeps, tap: AlertTap, msg: TappedMessage): Promise<{ toast: string; ok: boolean; after: Promise<void> }> {
   const now = deps.now ?? (() => new Date())
   const argv = tapArgv(tap)
   let r: { rc: number; stdout: string; stderr: string }
@@ -171,7 +172,7 @@ export async function serveAlertTap(deps: AlertTapDeps, tap: AlertTap, msg: Tapp
   if (!answer) {
     deps.stderr(`alert tap: ${argv.join(' ')} gave no answer: rc=${r.rc} ${r.stderr}\n`)
     const why = r.rc === 124 ? 'timed out' : `exit ${r.rc}`
-    return { toast: clip(`⚠ That didn't work (${why}).`, TOAST_MAX), after: Promise.resolve() }
+    return { toast: clip(`⚠ That didn't work (${why}).`, TOAST_MAX), ok: false, after: Promise.resolve() }
   }
   const toast = clip(answer.toast || (answer.ok ? 'Done.' : "⚠ That didn't work."), TOAST_MAX)
   const after = (async () => {
@@ -186,7 +187,8 @@ export async function serveAlertTap(deps: AlertTapDeps, tap: AlertTap, msg: Tapp
       deps.stderr(`alert tap: follow-up post failed: ${e}\n`)
     }
   })()
-  return { toast, after }
+  // ok: the command said the tap took. The caller marks the button only then.
+  return { toast, ok: answer.ok === true, after }
 }
 
 /** `Vera` -> `MK_VeraBot`, the form the tag relay recognizes. */
