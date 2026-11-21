@@ -35,6 +35,10 @@ import { PhrasePicker, phrasesFile } from './phrases.ts'
 import { type GroupPolicy } from './group-gate.ts'
 import { everyoneTagged, inboundDecision, inboundText, safeName, parseEnvFile, ALLOWED_UPDATES } from './inbound-gate.ts'
 import { relayTags, RelayLimiter, spawnRunner, readRoster, type RelayRequest } from './tag-relay.ts'
+import {
+  parseAlertTap, serveAlertTap, handleThumbsDown, readTopics, spawnOutRunner, appendTapLog,
+  type AlertTapDeps, type ThumbsDownDeps,
+} from './alert-tap.ts'
 import { runCreateForumTopic, runEditForumTopic } from './forum-topic.ts'
 import { openTapped, tappedLabel, type OmfTapDeps } from './omf-tap.ts'
 import { SeenPosts, PeerLimiter, montyPosted, pollPeerPosts, postKey, PEER_POLL_MS, type PeerDeps, type MontyDeps } from './peer-posts.ts'
@@ -786,9 +790,57 @@ const omfTapDeps: OmfTapDeps = {
   stderr: s => process.stderr.write(s),
 }
 
+// Alert buttons (al:, aw:) and the thumbs-down hand-off: alert-tap.ts.
+// Posts are logged like the bridge's other own posts when the chat is a group.
+const alertSend = async (chat_id: string, text: string, opts: { thread_id?: number; reply_to?: number }) => {
+  const sent = await bot.api.sendMessage(chat_id, text, {
+    ...(opts.thread_id != null ? { message_thread_id: opts.thread_id } : {}),
+    ...(opts.reply_to != null ? { reply_parameters: { message_id: opts.reply_to, allow_sending_without_reply: true } } : {}),
+  })
+  if (isGroupChatId(chat_id)) safeTee(tee, outEntry({ chat_id, thread_id: opts.thread_id, message_id: sent.message_id, reply_to: opts.reply_to, text, edit: false }))
+  return sent
+}
+const alertTapDeps: AlertTapDeps = {
+  run: spawnOutRunner,
+  send: alertSend,
+  topics: () => readTopics(),
+  relay: req => relay(req),
+  log: entry => appendTapLog(entry),
+  stderr: s => process.stderr.write(s),
+}
+const thumbsDownDeps: ThumbsDownDeps = {
+  run: spawnOutRunner,
+  topics: () => readTopics(),
+  agent: ACCESS_AGENT,
+  log: entry => appendTapLog(entry),
+  stderr: s => process.stderr.write(s),
+  seen: new Set<string>(),
+}
+
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   const permMatch = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
+
+  // An alert's button, or an aged wait's. Served here, like omf:, so the tap
+  // is answered whether or not this agent's session is alive: the command the
+  // tap runs holds the alert, and its answer says what to show him.
+  const alertTap = parseAlertTap(data)
+  if (alertTap) {
+    if (!loadAccess().allowFrom.includes(String(ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const tapped = ctx.callbackQuery.message
+    const served = await serveAlertTap(alertTapDeps, alertTap, {
+      chat_id: tapped ? String(tapped.chat.id) : undefined,
+      thread_id: tapped && 'message_thread_id' in tapped ? tapped.message_thread_id : undefined,
+      message_id: tapped?.message_id,
+      user_id: String(ctx.from.id),
+    })
+    await ctx.answerCallbackQuery({ text: served.toast }).catch(() => {})
+    void served.after
+    return
+  }
 
   if (permMatch) {
     const access = loadAccess()
@@ -1022,6 +1074,10 @@ bot.on('message_reaction', async ctx => {
   ]
 
   for (const { emoji, action } of events) {
+    // A thumbs-down on an alert in one of Page's two alert topics goes to
+    // Grady as one dispatch, from the bridge, and is not also handed to the
+    // session: the hand-off must not depend on a turn, and must happen once.
+    if (await handleThumbsDown(thumbsDownDeps, { chat_id, message_id: msgId, emoji, action, user_id: userId })) continue
     mcp.notification({
       method: 'notifications/claude/channel',
       params: {

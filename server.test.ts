@@ -2114,3 +2114,236 @@ test("everyone D17: a peer bot's @everyone, or anyone else's, carries no tag", (
   expect(fromMonty(['222'], { id: MONTY })).toBe(false)
   expect(everyoneTagged({ allowFrom: ['222'], groups: presence().groups }, { from: { id: 222 }, chat: FORUM, message: { text: '@everyone', message_thread_id: 40 } })).toBe(true)
 })
+
+// --- alert buttons and the thumbs-down hand-off --------------------------------
+// SPEC-alerts-through-page-2026-11-20, build step 3. Stubbed runner, API, topic
+// record and log: nothing here runs fleet-andon, dispatch or Telegram.
+import {
+  parseAlertTap, tapArgv, parseAnswer, serveAlertTap, postTalk, handleThumbsDown, readTopics, ownerBot,
+  FLEET_ANDON_BIN, AGED_WAIT_BIN, type AlertTapDeps, type ThumbsDownDeps, type Topics,
+} from './alert-tap.ts'
+
+const TOPICS_ALL: Topics = { chat_id: '-1009', owner: 'Page', threads: { p0_alerts: 1670, fleet_notifications: 1671, alerts_resolution: 1700 } }
+const TOPICS_NO_RES: Topics = { chat_id: '-1009', owner: 'Page', threads: { p0_alerts: 1670, fleet_notifications: 1671, alerts_resolution: undefined } }
+
+function alertHarness(answer: Record<string, unknown> | undefined, topics: Topics | null = TOPICS_ALL, rc = 0) {
+  const runs: string[][] = []
+  const sends: Array<{ chat_id: string; text: string; thread_id?: number; reply_to?: number }> = []
+  const relays: Array<{ chat_id: string; thread_id?: number; text: string }> = []
+  const logs: Array<Record<string, unknown>> = []
+  let refuse: number | undefined
+  const deps: AlertTapDeps = {
+    run: async argv => { runs.push(argv); return { rc, stdout: answer ? JSON.stringify(answer) + '\n' : '', stderr: answer ? '' : 'boom\n' } },
+    send: async (chat_id, text, opts) => {
+      if (refuse != null && opts.thread_id === refuse) throw new Error('refused')
+      sends.push({ chat_id, text, ...opts }); return { message_id: 900 + sends.length }
+    },
+    topics: () => topics ?? undefined,
+    relay: req => { relays.push({ chat_id: req.chat_id, thread_id: req.thread_id, text: req.posts[0].text }) },
+    log: e => { logs.push(e) },
+    stderr: () => {},
+    now: () => new Date('2026-11-21T12:00:00Z'),
+  }
+  return { deps, runs, sends, relays, logs, refuseThread: (t: number) => { refuse = t } }
+}
+const TAPPED = { chat_id: '-1009', thread_id: 1670, message_id: 55, user_id: '6324582303' }
+const al = (verb: string) => parseAlertTap(`al:${verb}:mini:0123456789ab`)!
+
+test('alert tap: callback data parses for the alert and aged-wait buttons and nothing else', () => {
+  expect(parseAlertTap('al:ig:mini:0123456789ab')).toEqual({ kind: 'al', verb: 'ig', host: 'mini', id: '0123456789ab' })
+  for (const v of ['ig', 's1', 's4', 's9', 'fx', 'tk']) expect(parseAlertTap(`al:${v}:maxi:abcdef`)?.verb).toBe(v)
+  for (const v of ['dn', 'sm', 'nn', 'tk']) expect(parseAlertTap(`aw:${v}:abcdef12`)).toEqual({ kind: 'aw', verb: v, id: 'abcdef12' })
+  for (const bad of ['al:zz:mini:abcdef', 'al:ig:mini:XYZ', 'al:ig:mi ni:abcdef', 'al:ig:abcdef', 'aw:ig:abcdef', 'omf:abcdef', 'al:ig:mini:abcdef:x', 'xal:ig:mini:abcdef', 'al:ig:mini;rm:abcdef']) {
+    expect(parseAlertTap(bad)).toBeUndefined()
+  }
+})
+
+test('alert tap: Ignore runs fleet-andon --tap for the latch host and toasts its answer', async () => {
+  const h = alertHarness({ ok: true, key: 'k:1', button: 'ignore', toast: 'Ignored.' })
+  const served = await serveAlertTap(h.deps, al('ig'), TAPPED)
+  await served.after
+  expect(h.runs).toEqual([[FLEET_ANDON_BIN, '--tap', 'ig', '--id', '0123456789ab', '--tap-host', 'mini']])
+  expect(served.toast).toBe('Ignored.')
+  expect(h.sends).toEqual([])
+})
+
+test('alert tap: each snooze button runs its own verb', () => {
+  expect(['s1', 's4', 's9'].map(v => tapArgv(al(v))[2])).toEqual(['s1', 's4', 's9'])
+})
+
+test('alert tap: an aged-wait button runs the aged-wait sender', async () => {
+  const h = alertHarness({ ok: true, key: 'wait:P0123', button: 'done-already', toast: 'Told Vera.' })
+  const served = await serveAlertTap(h.deps, parseAlertTap('aw:dn:abcdef12')!, TAPPED)
+  expect(h.runs).toEqual([[AGED_WAIT_BIN, '--tap', 'dn', '--id', 'abcdef12']])
+  expect(served.toast).toBe('Told Vera.')
+})
+
+test('alert tap: Show fix replies under the alert, in its thread', async () => {
+  const h = alertHarness({ ok: true, key: 'k:1', button: 'show-fix', toast: 'The fix is below.', reply: 'gws auth login, in a terminal on maxi' })
+  const served = await serveAlertTap(h.deps, al('fx'), TAPPED)
+  await served.after
+  expect(h.sends).toEqual([{ chat_id: '-1009', text: 'gws auth login, in a terminal on maxi', thread_id: 1670, reply_to: 55 }])
+})
+
+test('alert tap: Talk posts in Alerts resolution tagging the owner and relays the tag', async () => {
+  const h = alertHarness({ ok: true, key: 'k:1', button: 'talk', toast: 'Asking Vera.', talk: { owner: 'Vera', text: 'Vera is down (mini)' } })
+  const served = await serveAlertTap(h.deps, al('tk'), TAPPED)
+  await served.after
+  expect(h.sends).toEqual([{ chat_id: '-1009', text: '@MK_VeraBot Monty wants to talk about this alert: Vera is down (mini)', thread_id: 1700 }])
+  expect(h.relays).toEqual([{ chat_id: '-1009', thread_id: 1700, text: '@MK_VeraBot Monty wants to talk about this alert: Vera is down (mini)' }])
+  expect(ownerBot('Vera')).toBe('MK_VeraBot')
+  expect(ownerBot('not a name')).toBeUndefined()
+})
+
+test('alert tap: Talk with no Alerts resolution topic replies under the alert', async () => {
+  for (const topics of [TOPICS_NO_RES, null]) {
+    const h = alertHarness(undefined, topics)
+    expect(await postTalk(h.deps, { owner: 'Vera', text: 'Vera is down (mini)' }, TAPPED)).toBe('under-alert')
+    expect(h.sends).toEqual([{ chat_id: '-1009', text: '@MK_VeraBot Monty wants to talk about this alert: Vera is down (mini)', thread_id: 1670, reply_to: 55 }])
+    expect(h.relays.length).toBe(1)
+  }
+})
+
+test('alert tap: Talk whose post into Alerts resolution is refused replies under the alert', async () => {
+  const h = alertHarness(undefined)
+  h.refuseThread(1700)
+  expect(await postTalk(h.deps, { owner: 'Vera', text: 'x' }, TAPPED)).toBe('under-alert')
+  expect(h.sends.map(s => s.thread_id)).toEqual([1670])
+})
+
+test('alert tap: every tap writes one log line with the alert key and the button', async () => {
+  const h = alertHarness({ ok: true, key: 'chronometer:x@mini', button: 'snooze-4h', toast: 'Snoozed until 4:15pm.' })
+  await serveAlertTap(h.deps, al('s4'), TAPPED)
+  expect(h.logs).toEqual([{
+    ts: '2026-11-21T12:00:00.000Z', kind: 'al', key: 'chronometer:x@mini', button: 'snooze-4h', id: '0123456789ab', host: 'mini',
+    ok: true, rc: 0, chat_id: '-1009', thread_id: 1670, message_id: 55, user_id: '6324582303',
+  }])
+})
+
+test('alert tap: a command that fails toasts a failure and still logs the tap', async () => {
+  const h = alertHarness(undefined, TOPICS_ALL, 124)
+  const served = await serveAlertTap(h.deps, al('ig'), TAPPED)
+  expect(served.toast).toContain("didn't work")
+  expect(served.toast).toContain('timed out')
+  expect(h.logs.length).toBe(1)
+  expect(h.logs[0]).toMatchObject({ key: null, button: 'ig', ok: false, rc: 124 })
+  const thrown = alertHarness(undefined)
+  thrown.deps.run = async () => { throw new Error('spawn failed') }
+  expect((await serveAlertTap(thrown.deps, al('ig'), TAPPED)).toast).toContain("didn't work")
+})
+
+test('alert tap: a cleared alert toasts what the command said', async () => {
+  const h = alertHarness({ ok: false, toast: 'That alert has already cleared.' })
+  expect((await serveAlertTap(h.deps, al('ig'), TAPPED)).toast).toBe('That alert has already cleared.')
+  expect(parseAnswer('noise\n{"ok":true,"toast":"a"}\n')).toEqual({ ok: true, toast: 'a' })
+  expect(parseAnswer('no json')).toBeUndefined()
+})
+
+test('alert tap: the topic record gives thread ids, and a null one is absent', () => {
+  const rec = JSON.stringify({ chat_id: '-1009', owner: 'Page', topics: { p0_alerts: { thread_id: 1670 }, alerts_resolution: { thread_id: null } } })
+  expect(readTopics('x', () => rec)).toEqual({ chat_id: '-1009', owner: 'Page', threads: { p0_alerts: 1670, alerts_resolution: undefined } })
+  expect(readTopics('x', () => { throw new Error('ENOENT') })).toBeUndefined()
+  expect(readTopics('x', () => '{not json')).toBeUndefined()
+})
+
+function thumbsHarness(info: Record<string, unknown>, opts: { agent?: string; topics?: Topics | undefined; dispatchRc?: number } = {}) {
+  const runs: Array<{ argv: string[]; stdin?: string }> = []
+  const logs: Array<Record<string, unknown>> = []
+  const deps: ThumbsDownDeps = {
+    run: async (argv, stdin) => {
+      runs.push({ argv, stdin })
+      if (argv.includes('--message-info')) return { rc: 0, stdout: JSON.stringify(info) + '\n', stderr: '' }
+      return { rc: opts.dispatchRc ?? 0, stdout: '', stderr: '' }
+    },
+    topics: () => ('topics' in opts ? opts.topics : TOPICS_ALL),
+    agent: opts.agent ?? 'Page',
+    log: e => { logs.push(e) },
+    stderr: () => {},
+    seen: new Set<string>(),
+    now: () => new Date('2026-11-21T12:00:00Z'),
+  }
+  const dispatches = () => runs.filter(r => r.argv[1] === 'send')
+  return { deps, runs, logs, dispatches }
+}
+const DOWN = { chat_id: '-1009', message_id: 77, emoji: '👎', action: 'added', user_id: '6324582303' }
+const INFO = { found: true, key: 'brody-google-login:priv.legal@maxi', text: "Needs you: Brody can't read priv.legal mail (maxi)", topic: 'p0_alerts', host: 'maxi', legacy_caller: false }
+
+test('thumbs-down: one dispatch to Grady with the key, text and topic', async () => {
+  const h = thumbsHarness(INFO)
+  expect(await handleThumbsDown(h.deps, DOWN)).toBe(true)
+  expect(h.runs[0].argv).toEqual([FLEET_ANDON_BIN, '--message-info', '--chat', '-1009', '--message-id', '77'])
+  expect(h.dispatches().length).toBe(1)
+  const d = h.dispatches()[0]
+  expect(d.argv).toEqual(['dispatch', 'send', '--to', 'agent:Grady', '--from', 'Page', '--tier', '2',
+    '--subject', 'Thumbs-down on an alert: brody-google-login:priv.legal@maxi', '--body', '-'])
+  expect(d.stdin).toContain('- key: brody-google-login:priv.legal@maxi')
+  expect(d.stdin).toContain('- topic: p0_alerts')
+  expect(d.stdin).toContain("Needs you: Brody can't read priv.legal mail (maxi)")
+  expect(h.logs).toEqual([{ ts: '2026-11-21T12:00:00.000Z', kind: 'thumbs-down', key: 'brody-google-login:priv.legal@maxi', button: 'thumbs-down',
+    topic: 'p0_alerts', host: 'maxi', ok: true, rc: 0, chat_id: '-1009', message_id: 77, user_id: '6324582303' }])
+})
+
+test('thumbs-down: a second reaction on the same message is not a second dispatch', async () => {
+  const h = thumbsHarness(INFO)
+  expect(await handleThumbsDown(h.deps, DOWN)).toBe(true)
+  expect(await handleThumbsDown(h.deps, DOWN)).toBe(true)
+  expect(h.dispatches().length).toBe(1)
+  const failed = thumbsHarness(INFO, { dispatchRc: 7 })
+  await handleThumbsDown(failed.deps, DOWN)
+  await handleThumbsDown(failed.deps, DOWN)
+  expect(failed.dispatches().length).toBe(2)
+})
+
+test('thumbs-down: only the topics owner hands off', async () => {
+  const h = thumbsHarness(INFO, { agent: 'Vera' })
+  expect(await handleThumbsDown(h.deps, DOWN)).toBe(false)
+  expect(h.runs).toEqual([])
+  const unverified = thumbsHarness(INFO, { agent: '<Agent>' })
+  expect(await handleThumbsDown(unverified.deps, DOWN)).toBe(false)
+})
+
+test('thumbs-down: another emoji, a removal, another chat, an unknown message and another topic are not handed off', async () => {
+  for (const r of [{ ...DOWN, emoji: '👍' }, { ...DOWN, action: 'removed' }, { ...DOWN, chat_id: '-1555' }]) {
+    const h = thumbsHarness(INFO)
+    expect(await handleThumbsDown(h.deps, r)).toBe(false)
+    expect(h.runs).toEqual([])
+  }
+  for (const info of [{ found: false }, { ...INFO, topic: 'page' }, { ...INFO, topic: '' }]) {
+    const h = thumbsHarness(info)
+    expect(await handleThumbsDown(h.deps, DOWN)).toBe(false)
+    expect(h.dispatches()).toEqual([])
+  }
+  const noTopics = thumbsHarness(INFO, { topics: undefined })
+  expect(await handleThumbsDown(noTopics.deps, DOWN)).toBe(false)
+})
+
+test('thumbs-down: a message sent straight through notify-monty says it has no key', async () => {
+  const h = thumbsHarness({ found: true, key: '', text: 'T\nM', topic: 'fleet_notifications', host: 'mini', legacy_caller: true })
+  expect(await handleThumbsDown(h.deps, DOWN)).toBe(true)
+  expect(h.dispatches()[0].stdin).toContain('- key: (none: sent straight through notify-monty')
+  expect(h.dispatches()[0].stdin).toContain('- caller states a consequence: NO')
+})
+
+test('alert tap: the server serves al: and aw: taps itself, for allowFrom only, before any other handler', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf("bot.on('callback_query:data'")
+  const body = src.slice(start, src.indexOf('const omfMatch = '))
+  const at = body.indexOf('const alertTap = parseAlertTap(data)')
+  expect(at).toBeGreaterThan(-1)
+  expect(at).toBeLessThan(body.indexOf('if (permMatch) {'))
+  const block = body.slice(at, body.indexOf('if (permMatch) {'))
+  expect(block).toContain("if (!loadAccess().allowFrom.includes(String(ctx.from.id))) {")
+  expect(block).toContain('await serveAlertTap(alertTapDeps, alertTap, {')
+  expect(block).toContain('await ctx.answerCallbackQuery({ text: served.toast })')
+  expect(src).toContain('reply_parameters: { message_id: opts.reply_to, allow_sending_without_reply: true }')
+})
+
+test('thumbs-down: the server offers each reaction to the hand-off before the session', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf("bot.on('message_reaction'")
+  const body = src.slice(start, src.indexOf("bot.on('message:text'"))
+  const at = body.indexOf('if (await handleThumbsDown(thumbsDownDeps, { chat_id, message_id: msgId, emoji, action, user_id: userId })) continue')
+  expect(at).toBeGreaterThan(-1)
+  expect(at).toBeLessThan(body.indexOf('mcp.notification({'))
+  expect(body.indexOf('if (!access.allowFrom.includes(userId)) return')).toBeLessThan(at)
+})
