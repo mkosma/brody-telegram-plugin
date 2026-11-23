@@ -43,6 +43,9 @@ import {
   type AlertTapDeps, type ThumbsDownDeps, type ReactionLogDeps,
 } from './alert-tap.ts'
 import { runCreateForumTopic, runEditForumTopic } from './forum-topic.ts'
+import { replyContext } from './reply-context.ts'
+import { logMontyReaction, type ReactionLogSinkDeps } from './reaction-log.ts'
+import { recordGroupAdmin } from './group-admin.ts'
 import { openTapped, tappedLabel, type OmfTapDeps } from './omf-tap.ts'
 import { SeenPosts, PeerLimiter, montyPosted, pollPeerPosts, postKey, PEER_POLL_MS, type PeerDeps, type MontyDeps } from './peer-posts.ts'
 import { inboundContext, INBOUND_CONTEXT_CMD, type ContextDeps } from './inbound-context.ts'
@@ -415,7 +418,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has a message_thread_id attribute, pass it back to reply into the same thread. It does NOT mean the chat is a forum: per the Bot API that field is the id of a message thread OR a forum topic, so an ordinary reply chain in any supergroup carries one. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has a message_thread_id attribute, pass it back to reply into the same thread. It does NOT mean the chat is a forum: per the Bot API that field is the id of a message thread OR a forum topic, so an ordinary reply chain in any supergroup carries one. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses. When the sender replied to an earlier message, the tag carries reply_to (that message\'s id), reply_to_text (its first 300 characters, on one line) and reply_to_from (its author): that is the message they are answering.',
       '',
       'The FIRST thing to do on an inbound message is call react with \u{1F440} on its message_id. That is the sender\'s only signal that a live agent has actually read it: nothing in the transport reacts on your behalf, by design, because a transport-level reaction cannot tell "an agent read this" apart from "the bot process is running." React first, then do the work.',
       '',
@@ -889,6 +892,14 @@ const thumbsDownDeps: ThumbsDownDeps = {
   stderr: s => process.stderr.write(s),
   seen: new Set<string>(),
 }
+// Every reaction of his in a group, into the fleet's one reaction log (reaction-log.ts).
+const reactionSinkDeps: ReactionLogSinkDeps = {
+  run: spawnOutRunner,
+  allowFrom: () => loadAccess().allowFrom,
+  bot: () => botUsername,
+  agent: ACCESS_AGENT,
+  stderr: s => process.stderr.write(s),
+}
 const reactionLogDeps: ReactionLogDeps = {
   run: spawnOutRunner,
   topics: () => readTopics(),
@@ -1181,6 +1192,13 @@ bot.on('message_reaction', async ctx => {
   for (const { emoji, action } of events) {
     // A thumbs-up on a pinned question is his answer to it (pin.ts).
     if (emoji === '👍' && action === 'added') answered(userId, chat_id, msgId, 'thumbs-up')
+    // Every reaction of his in a group goes to the fleet's one reaction log,
+    // from whichever bots are sent it, so no agent depends on its own bot
+    // receiving the update. Not awaited: it only logs.
+    void logMontyReaction(reactionSinkDeps, {
+      chat_id, message_id: msgId, emoji, action, user_id: userId,
+      ts: new Date((reaction.date ?? 0) * 1000).toISOString(),
+    })
     // Every reaction of his on an alert in one of Page's two alert topics is
     // one line in the tap log: his thumbs-up there is an acknowledgement, and
     // the row that reads it reads that log. Not awaited: it only logs, and
@@ -1519,6 +1537,8 @@ async function handleInbound(
         user: from.username ?? String(from.id),
         user_id: String(from.id),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+        // Which message this one replies to, when it is a reply (reply-context.ts).
+        ...replyContext(ctx.message),
         ...(posted === 'halt' ? { command: 'halt' } : {}),
         ...(everyone ? { tagged: 'everyone' } : {}),
         ...(imagePath ? { image_path: imagePath } : {}),
@@ -1626,6 +1646,15 @@ void (async () => {
           attempt = 0
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+          // Is this bot an administrator in each group it serves? Telegram
+          // sends reactions only to one that is (group-admin.ts). Reported,
+          // never changed: the right is Monty's group setting.
+          void recordGroupAdmin({
+            getChatMember: (chat, user) => bot.api.getChatMember(chat, user),
+            groups: () => Object.keys(loadAccess().groups).filter(isGroupChatId),
+            bot: info.username, bot_id: info.id, agent: ACCESS_AGENT, dir: TEE_DIR,
+            stderr: s => process.stderr.write(s),
+          })
           void bot.api.setMyCommands(
             [
               { command: 'start', description: 'Welcome and setup guide' },
