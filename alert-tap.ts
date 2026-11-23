@@ -19,7 +19,10 @@
  *     talk?:  { owner: string, text: string } }  // "Talk to <owner>"
  *
  * Callback data, 64 bytes at most:
- *   al:<verb>:<host>:<id>   an alert      verb: ig s1 s4 s9 fx tk
+ *   al:<verb>:<host>:<id>   an alert      verb: dg tk ig s1 s4 s9 fx
+ *                           dg is Downgrade to P2, the one choice on a P0 post
+ *                           since 2026-11-23; ig, s1, s4, s9 and fx stay served
+ *                           for posts sent before then and for alerts below P0
  *   aw:<verb>:<id>          an aged wait  verb: dn sm nn tk
  * "Open doc" is not here: it is an ordinary omf: button.
  *
@@ -54,7 +57,7 @@ export type AlertTap =
   | { kind: 'al'; verb: string; host: string; id: string }
   | { kind: 'aw'; verb: string; id: string }
 
-const AL_VERBS = new Set(['ig', 's1', 's4', 's9', 'fx', 'tk'])
+const AL_VERBS = new Set(['dg', 'ig', 's1', 's4', 's9', 'fx', 'tk'])
 const AW_VERBS = new Set(['dn', 'sm', 'nn', 'tk'])
 
 /** Parse callback data. Anything that is not exactly one of the two forms is not ours. */

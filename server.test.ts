@@ -2151,7 +2151,8 @@ const al = (verb: string) => parseAlertTap(`al:${verb}:mini:0123456789ab`)!
 
 test('alert tap: callback data parses for the alert and aged-wait buttons and nothing else', () => {
   expect(parseAlertTap('al:ig:mini:0123456789ab')).toEqual({ kind: 'al', verb: 'ig', host: 'mini', id: '0123456789ab' })
-  for (const v of ['ig', 's1', 's4', 's9', 'fx', 'tk']) expect(parseAlertTap(`al:${v}:maxi:abcdef`)?.verb).toBe(v)
+  for (const v of ['dg', 'ig', 's1', 's4', 's9', 'fx', 'tk']) expect(parseAlertTap(`al:${v}:maxi:abcdef`)?.verb).toBe(v)
+  expect(tapArgv(parseAlertTap('al:dg:mini:0123456789ab')!)).toEqual([FLEET_ANDON_BIN, '--tap', 'dg', '--id', '0123456789ab', '--tap-host', 'mini'])
   for (const v of ['dn', 'sm', 'nn', 'tk']) expect(parseAlertTap(`aw:${v}:abcdef12`)).toEqual({ kind: 'aw', verb: v, id: 'abcdef12' })
   for (const bad of ['al:zz:mini:abcdef', 'al:ig:mini:XYZ', 'al:ig:mi ni:abcdef', 'al:ig:abcdef', 'aw:ig:abcdef', 'omf:abcdef', 'al:ig:mini:abcdef:x', 'xal:ig:mini:abcdef', 'al:ig:mini;rm:abcdef']) {
     expect(parseAlertTap(bad)).toBeUndefined()
