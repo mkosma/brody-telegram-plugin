@@ -26,7 +26,8 @@
  *   aw:<verb>:<id>          an aged wait  verb: dn sm nn tk
  * "Open doc" is not here: it is an ordinary omf: button.
  *
- * EVERY TAP IS LOGGED with the alert key and the button, one JSON line. A
+ * EVERY TAP IS LOGGED with the alert key and the button, one JSON line, and so
+ * is every reaction from him on an alert (`button: "reaction:<emoji>"`). A
  * wait counts as having reached Monty only when he taps one of its buttons
  * (Taiichi's measure), and this log is what that reading counts.
  *
@@ -323,6 +324,71 @@ export async function handleThumbsDown(
       chat_id: r.chat_id, message_id: r.message_id, user_id: r.user_id,
     })
   } catch (e) { deps.stderr(`thumbs-down: log write failed: ${e}\n`) }
+  return true
+}
+
+// --- every reaction on an alert, logged ------------------------------------------
+
+export type ReactionLogDeps = {
+  run: OutRunner
+  topics: () => Topics | undefined
+  /** This bridge's agent, as the claude() wrapper verified it, or '<Agent>'. */
+  agent: string
+  /** Monty's user ids, from this bridge's own access config. Never written here. */
+  allowFrom: () => string[]
+  log: (entry: Record<string, unknown>) => void
+  stderr: (s: string) => void
+  now?: () => Date
+}
+
+/**
+ * Every reaction from Monty on a message in one of the two alert topics is
+ * ONE line in the tap log, in the shape a tap writes, with
+ * `button: "reaction:<emoji>"` and the alert's key. Added and removed both,
+ * told apart by `action`.
+ *
+ * WHY. His thumbs-up on an alert is an acknowledgement of it, and until this
+ * the bridge wrote a reaction to no log: `escalate-unanswered-blocks` could
+ * read a tap and a reply and not a 👍, so an alert he had plainly seen was
+ * bypassed anyway. Grady's brief of 2026-11-23, class 2 batch 2, item 2.
+ *
+ * It logs and does nothing else. A 👎 is still handed to Grady by
+ * handleThumbsDown, which keeps its own line; the session still gets the
+ * reaction. Returns true when a line was written.
+ *
+ * ONLY THE TOPICS' OWNER LOGS, for the reason only it hands off a
+ * thumbs-down: every bot in the group is sent every reaction, and one
+ * reaction must be one line.
+ */
+export async function logAlertReaction(
+  deps: ReactionLogDeps,
+  r: { chat_id: string; message_id: number; emoji: string; action: string; user_id: string },
+): Promise<boolean> {
+  if (!deps.allowFrom().includes(r.user_id)) return false
+  const topics = deps.topics()
+  if (!topics?.chat_id || topics.chat_id !== r.chat_id) return false
+  if (!topics.owner || topics.owner !== deps.agent) return false
+
+  let info: MessageInfo | undefined
+  try {
+    const looked = await deps.run([FLEET_ANDON_BIN, '--message-info', '--chat', r.chat_id, '--message-id', String(r.message_id)], undefined, LOOKUP_TIMEOUT_MS)
+    info = parseAnswer(looked.stdout) as MessageInfo | undefined
+  } catch (e) {
+    deps.stderr(`alert reaction: lookup failed: ${e}\n`)
+  }
+  if (!info?.found || !(ALERT_TOPICS as readonly string[]).includes(info.topic ?? '')) return false
+
+  const now = deps.now ?? (() => new Date())
+  try {
+    deps.log({
+      ts: now().toISOString(), kind: 'reaction', key: info.key || null, button: `reaction:${r.emoji}`,
+      action: r.action, topic: info.topic, host: info.host ?? null, ok: true, rc: 0,
+      chat_id: r.chat_id, thread_id: topics.threads[info.topic ?? ''] ?? null, message_id: r.message_id, user_id: r.user_id,
+    })
+  } catch (e) {
+    deps.stderr(`alert reaction: log write failed: ${e}\n`)
+    return false
+  }
   return true
 }
 

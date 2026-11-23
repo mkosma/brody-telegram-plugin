@@ -2119,8 +2119,8 @@ test("everyone D17: a peer bot's @everyone, or anyone else's, carries no tag", (
 // SPEC-alerts-through-page-2026-11-20, build step 3. Stubbed runner, API, topic
 // record and log: nothing here runs fleet-andon, dispatch or Telegram.
 import {
-  parseAlertTap, tapArgv, parseAnswer, serveAlertTap, postTalk, handleThumbsDown, readTopics, ownerBot,
-  FLEET_ANDON_BIN, AGED_WAIT_BIN, type AlertTapDeps, type ThumbsDownDeps, type Topics,
+  parseAlertTap, tapArgv, parseAnswer, serveAlertTap, postTalk, handleThumbsDown, logAlertReaction, readTopics, ownerBot,
+  FLEET_ANDON_BIN, AGED_WAIT_BIN, type AlertTapDeps, type ThumbsDownDeps, type ReactionLogDeps, type Topics,
 } from './alert-tap.ts'
 
 const TOPICS_ALL: Topics = { chat_id: '-1009', owner: 'Page', threads: { p0_alerts: 1670, fleet_notifications: 1671, alerts_resolution: 1700 } }
@@ -2323,6 +2323,96 @@ test('thumbs-down: a message sent straight through notify-monty says it has no k
   expect(await handleThumbsDown(h.deps, DOWN)).toBe(true)
   expect(h.dispatches()[0].stdin).toContain('- key: (none: sent straight through notify-monty')
   expect(h.dispatches()[0].stdin).toContain('- caller states a consequence: NO')
+})
+
+// --- every reaction on an alert, logged ---
+// Grady's brief of 2026-11-23, class 2 batch 2, item 2. Stubbed runner, topic
+// record, access list and log: nothing here runs fleet-andon or writes a log.
+function reactionHarness(info: Record<string, unknown> | undefined, opts: { agent?: string; topics?: Topics | undefined; allowFrom?: string[]; logThrows?: boolean } = {}) {
+  const runs: string[][] = []
+  const logs: Array<Record<string, unknown>> = []
+  const errs: string[] = []
+  const deps: ReactionLogDeps = {
+    run: async argv => { runs.push(argv); return { rc: 0, stdout: info ? JSON.stringify(info) + '\n' : '', stderr: '' } },
+    topics: () => ('topics' in opts ? opts.topics : TOPICS_ALL),
+    agent: opts.agent ?? 'Page',
+    allowFrom: () => opts.allowFrom ?? ['6324582303'],
+    log: e => { if (opts.logThrows) throw new Error('disk full'); logs.push(e) },
+    stderr: s => { errs.push(s) },
+    now: () => new Date('2026-11-23T18:00:00Z'),
+  }
+  return { deps, runs, logs, errs }
+}
+const UP = { chat_id: '-1009', message_id: 77, emoji: '👍', action: 'added', user_id: '6324582303' }
+
+test('alert reaction: his thumbs-up on an alert is one log line with the key and button reaction:👍', async () => {
+  const h = reactionHarness(INFO)
+  expect(await logAlertReaction(h.deps, UP)).toBe(true)
+  expect(h.runs).toEqual([[FLEET_ANDON_BIN, '--message-info', '--chat', '-1009', '--message-id', '77']])
+  expect(h.logs).toEqual([{ ts: '2026-11-23T18:00:00.000Z', kind: 'reaction', key: 'brody-google-login:priv.legal@maxi', button: 'reaction:👍',
+    action: 'added', topic: 'p0_alerts', host: 'maxi', ok: true, rc: 0, chat_id: '-1009', thread_id: 1670, message_id: 77, user_id: '6324582303' }])
+})
+
+test('alert reaction: every emoji is logged, and a removal says removed', async () => {
+  const h = reactionHarness({ ...INFO, topic: 'fleet_notifications' })
+  expect(await logAlertReaction(h.deps, { ...UP, emoji: '👎' })).toBe(true)
+  expect(await logAlertReaction(h.deps, { ...UP, emoji: '🔥', action: 'removed' })).toBe(true)
+  expect(h.logs.map(l => [l.button, l.action, l.thread_id])).toEqual([['reaction:👎', 'added', 1671], ['reaction:🔥', 'removed', 1671]])
+  const keyless = reactionHarness({ found: true, key: '', text: 'T', topic: 'p0_alerts', host: 'mini' })
+  expect(await logAlertReaction(keyless.deps, UP)).toBe(true)
+  expect(keyless.logs[0].key).toBe(null)
+})
+
+test('alert reaction: only a user in the bridge\'s own allowFrom is logged', async () => {
+  const h = reactionHarness(INFO)
+  expect(await logAlertReaction(h.deps, { ...UP, user_id: '8864978552' })).toBe(false)
+  expect(h.runs).toEqual([])
+  expect(h.logs).toEqual([])
+  const other = reactionHarness(INFO, { allowFrom: ['42'] })
+  expect(await logAlertReaction(other.deps, { ...UP, user_id: '42' })).toBe(true)
+  expect(other.logs[0].user_id).toBe('42')
+})
+
+test('alert reaction: only the topics owner logs, so one reaction is one line', async () => {
+  for (const agent of ['Vera', '<Agent>']) {
+    const h = reactionHarness(INFO, { agent })
+    expect(await logAlertReaction(h.deps, UP)).toBe(false)
+    expect(h.runs).toEqual([])
+    expect(h.logs).toEqual([])
+  }
+})
+
+test('alert reaction: another chat, an unknown message and another topic are not logged', async () => {
+  const elsewhere = reactionHarness(INFO)
+  expect(await logAlertReaction(elsewhere.deps, { ...UP, chat_id: '-1555' })).toBe(false)
+  expect(elsewhere.runs).toEqual([])
+  for (const info of [{ found: false }, { ...INFO, topic: 'page' }, { ...INFO, topic: '' }, undefined]) {
+    const h = reactionHarness(info)
+    expect(await logAlertReaction(h.deps, UP)).toBe(false)
+    expect(h.logs).toEqual([])
+  }
+  const noTopics = reactionHarness(INFO, { topics: undefined })
+  expect(await logAlertReaction(noTopics.deps, UP)).toBe(false)
+})
+
+test('alert reaction: a log write that throws is reported and does not reject', async () => {
+  const h = reactionHarness(INFO, { logThrows: true })
+  expect(await logAlertReaction(h.deps, UP)).toBe(false)
+  expect(h.errs.join('')).toContain('alert reaction: log write failed')
+})
+
+test('alert reaction: the server logs each allowlisted reaction without waiting, before the hand-off', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const start = src.indexOf("bot.on('message_reaction'")
+  const body = src.slice(start, src.indexOf("bot.on('message:text'"))
+  const at = body.indexOf('void logAlertReaction(reactionLogDeps, { chat_id, message_id: msgId, emoji, action, user_id: userId })')
+  expect(at).toBeGreaterThan(-1)
+  expect(at).toBeLessThan(body.indexOf('if (await handleThumbsDown('))
+  expect(body.indexOf('if (!access.allowFrom.includes(userId)) return')).toBeLessThan(at)
+  expect(src).toContain('allowFrom: () => loadAccess().allowFrom,\n  log: entry => appendTapLog(entry),')
+  // Monty's id is the bridge's config, never a literal in the logger.
+  const logger = readFileSync(join(import.meta.dir, 'alert-tap.ts'), 'utf8')
+  expect(/\b\d{9,}\b/.test(logger.slice(logger.indexOf('export async function logAlertReaction'), logger.indexOf('// --- the real runner and log')))).toBe(false)
 })
 
 test('alert tap: the server serves al: and aw: taps itself, for allowFrom only, before any other handler', () => {

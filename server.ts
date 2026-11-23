@@ -39,8 +39,8 @@ import { type GroupPolicy } from './group-gate.ts'
 import { everyoneTagged, inboundDecision, inboundText, safeName, parseEnvFile, ALLOWED_UPDATES } from './inbound-gate.ts'
 import { relayTags, RelayLimiter, spawnRunner, readRoster, type RelayRequest } from './tag-relay.ts'
 import {
-  parseAlertTap, serveAlertTap, handleThumbsDown, readTopics, spawnOutRunner, appendTapLog,
-  type AlertTapDeps, type ThumbsDownDeps,
+  parseAlertTap, serveAlertTap, handleThumbsDown, logAlertReaction, readTopics, spawnOutRunner, appendTapLog,
+  type AlertTapDeps, type ThumbsDownDeps, type ReactionLogDeps,
 } from './alert-tap.ts'
 import { runCreateForumTopic, runEditForumTopic } from './forum-topic.ts'
 import { openTapped, tappedLabel, type OmfTapDeps } from './omf-tap.ts'
@@ -889,6 +889,14 @@ const thumbsDownDeps: ThumbsDownDeps = {
   stderr: s => process.stderr.write(s),
   seen: new Set<string>(),
 }
+const reactionLogDeps: ReactionLogDeps = {
+  run: spawnOutRunner,
+  topics: () => readTopics(),
+  agent: ACCESS_AGENT,
+  allowFrom: () => loadAccess().allowFrom,
+  log: entry => appendTapLog(entry),
+  stderr: s => process.stderr.write(s),
+}
 
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
@@ -1173,6 +1181,11 @@ bot.on('message_reaction', async ctx => {
   for (const { emoji, action } of events) {
     // A thumbs-up on a pinned question is his answer to it (pin.ts).
     if (emoji === '👍' && action === 'added') answered(userId, chat_id, msgId, 'thumbs-up')
+    // Every reaction of his on an alert in one of Page's two alert topics is
+    // one line in the tap log: his thumbs-up there is an acknowledgement, and
+    // the row that reads it reads that log. Not awaited: it only logs, and
+    // neither the hand-off nor the session waits on its lookup.
+    void logAlertReaction(reactionLogDeps, { chat_id, message_id: msgId, emoji, action, user_id: userId })
     // A thumbs-down on an alert in one of Page's two alert topics goes to
     // Grady as one dispatch, from the bridge, and is not also handed to the
     // session: the hand-off must not depend on a turn, and must happen once.
