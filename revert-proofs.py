@@ -21,6 +21,9 @@ Extended for pins, copy buttons and button state (Monty, 2026-11-21,
 Telegram msgs 1816 and 1855; ids PN*, CP*, BS*). The three reverts the design
 names are PN1-PN4 (no unpin on answer), PN5 (pin of a non-question) and
 PN6-PN7 (silent failure on the missing right).
+Extended for BRIEF-reactions-reach-only-the-poster-2026-11-24 (ids OS*): a
+reaction reaches the session only on this bot's own message, a pin it holds
+or a private chat.
 
 The baseline includes "presence D6", which loads Vera's who-hears from the
 agents repo and requires it to agree with the gate. To run against a copy of
@@ -964,6 +967,40 @@ REVERTS = [
      '  return { toast, ok: answer.ok === true, after }',
      '  return { toast, ok: true, after }',
      'alert tap: the served tap says whether the command took it'),
+    # BRIEF-reactions-reach-only-the-poster-2026-11-24 (ids OS*): a reaction
+    # in a group reaches the session only when the message is this bot's own.
+    ("OS1", "reaction gate", "server.ts",
+     "    if (!ours) {",
+     "    if (false) {",
+     "reactions, end to end: only a reaction on this bot's own message, a held pin or a private chat reaches the session"),
+    ("OS2", "reaction seed", "server.ts",
+     "          ownSent.seed({ dir: TEE_DIR, bot: info.username, stderr: s => process.stderr.write(s) })\n",
+     "",
+     "reactions, end to end: only a reaction on this bot's own message, a held pin or a private chat reaches the session"),
+    ("OS3", "private chat", "own-sent.ts",
+     "  if (!isGroupChatId(chat_id)) return 'private'\n",
+     "",
+     "own sent: a private chat's reaction is always ours, seeded or not"),
+    ("OS4", "held pin", "own-sent.ts",
+     "  if (pins.some(p => p.chat_id === chat_id && p.message_id === message_id)) return 'pin'\n",
+     "",
+     "own sent: a reaction on a pin this bot holds is ours, though the message is not in the set"),
+    ("OS5", "grows on send", "own-sent.ts",
+     "        this.note(String(entry.chat_id), entry.message_id)\n",
+     "",
+     "own sent: the set grows on send, through the post log's own out line"),
+    ("OS6", "seed age bound", "own-sent.ts",
+     "          if (!(at >= oldest)) continue\n",
+     "",
+     "own sent: the seed skips a record older than 7 days"),
+    ("OS7", "seed count bound", "own-sent.ts",
+     "    for (const [chat_id, message_id] of found.slice(-this.max)) this.note(chat_id, message_id)\n",
+     "    for (const [chat_id, message_id] of found.slice(0, this.max)) this.note(chat_id, message_id)\n",
+     "own sent: the seed keeps only the latest out records, across the rotated file and the current one"),
+    ("OS8", "fail to deliver", "own-sent.ts",
+     "  if (!deps.own.seeded) return 'unseeded'\n",
+     "",
+     "own sent: an unreadable post log delivers everything and says so in one line"),
 ]
 
 FAIL_RE = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)

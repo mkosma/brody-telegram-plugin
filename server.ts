@@ -45,6 +45,7 @@ import {
 import { runCreateForumTopic, runEditForumTopic } from './forum-topic.ts'
 import { replyContext } from './reply-context.ts'
 import { logMontyReaction, type ReactionLogSinkDeps } from './reaction-log.ts'
+import { OwnSent, reactionIsOurs, notOursEntry } from './own-sent.ts'
 import { recordGroupAdmin } from './group-admin.ts'
 import { openTapped, tappedLabel, type OmfTapDeps } from './omf-tap.ts'
 import { SeenPosts, PeerLimiter, montyPosted, pollPeerPosts, postKey, PEER_POLL_MS, type PeerDeps, type MontyDeps } from './peer-posts.ts'
@@ -132,7 +133,11 @@ let botUsername = ''
 // The post log (spec item 1): every group post this bot sends or receives, one
 // JSON line each, in a file named for this bot. Local disk only; a failed write
 // is one stderr line and never touches the send.
-const tee = makeTee({ dir: TEE_DIR, bot: () => botUsername })
+//
+// Every out line also lands in ownSent, this bot's own sent messages: a
+// reaction in a group reaches the session only on one of those (own-sent.ts).
+const ownSent = new OwnSent()
+const tee = ownSent.wrap(makeTee({ dir: TEE_DIR, bot: () => botUsername }))
 
 // The tag relay (spec item 3): a group post of ours that tags another fleet
 // agent's bot (MK_<Name>Bot) is delivered to that agent as a `dispatch send`
@@ -1189,6 +1194,10 @@ bot.on('message_reaction', async ctx => {
     ...removed.map(emoji => ({ emoji, action: 'removed' })),
   ]
 
+  // Is the message ours: a private chat, one this bot sent, or a pin it holds
+  // (own-sent.ts). Asked before the loop, since his thumbs-up releases the pin.
+  const ours = reactionIsOurs({ own: ownSent, pins: () => pinDeps.store.load() }, chat_id, msgId)
+
   for (const { emoji, action } of events) {
     // A thumbs-up on a pinned question is his answer to it (pin.ts).
     if (emoji === '👍' && action === 'added') answered(userId, chat_id, msgId, 'thumbs-up')
@@ -1208,6 +1217,13 @@ bot.on('message_reaction', async ctx => {
     // Grady as one dispatch, from the bridge, and is not also handed to the
     // session: the hand-off must not depend on a turn, and must happen once.
     if (await handleThumbsDown(thumbsDownDeps, { chat_id, message_id: msgId, emoji, action, user_id: userId })) continue
+    // Every admin bot in a group is sent every reaction there. One on a
+    // peer's message is a line in the post log and no turn: the reaction log
+    // above is how any agent learns of it.
+    if (!ours) {
+      safeTee(tee, notOursEntry({ chat_id, message_id: msgId, emoji, action, user_id: userId, ts: new Date((reaction.date ?? 0) * 1000).toISOString() }))
+      continue
+    }
     mcp.notification({
       method: 'notifications/claude/channel',
       params: {
@@ -1646,6 +1662,9 @@ void (async () => {
           attempt = 0
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+          // What this bot has sent, from its own post log on this host. When
+          // that cannot be read, every reaction goes to the session as before.
+          ownSent.seed({ dir: TEE_DIR, bot: info.username, stderr: s => process.stderr.write(s) })
           // Is this bot an administrator in each group it serves? Telegram
           // sends reactions only to one that is (group-admin.ts). Reported,
           // never changed: the right is Monty's group setting.
