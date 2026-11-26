@@ -4,7 +4,7 @@
 import { test, expect } from 'bun:test'
 import { readFileSync } from 'fs'
 import { join } from 'path'
-import { planHuddle, parseHuddleCommand, parseHuddleAnswer, runHuddleSection, runHuddleAnswer, chunkLines, unescapeMarkdown, messageLink, HUDDLE_BIN, HUDDLE_TIMEOUT_MS, HUDDLE_MAX_STDOUT, HUDDLE_ANSWER_RE, NOBODY_HERE, type HuddleDeps, type HuddleMessage } from './huddle.ts'
+import { planHuddle, parseHuddleCommand, parseHuddleAnswer, runHuddleSection, runHuddleAnswer, chunkLines, unescapeMarkdown, messageLink, HUDDLE_BIN, HUDDLE_TIMEOUT_MS, HUDDLE_ANSWER_TIMEOUT_MS, HUDDLE_MAX_STDOUT, HUDDLE_ANSWER_RE, NOBODY_HERE, type HuddleDeps, type HuddleMessage } from './huddle.ts'
 import { WHO_HEARS_BIN, WHO_TIMEOUT_MS, type OutputRunner } from './invite-excuse.ts'
 
 const GROUP = '-1004286764447'
@@ -119,19 +119,14 @@ test('huddle: a long answer is posted as whole lines in posts of at most 4096 ch
 })
 
 test('huddle answer: each of the four forms from Monty runs huddle answer on the answerer alone, with his words, his message link and the agent', async () => {
-  const cases: Array<[string, string[]]> = [
-    ['142 yes Friday', ['142', 'yes', 'Friday']],
-    ['142 no', ['142', 'no']],
-    ['  142  Not Now Dec 3', ['142', 'not-now', 'Dec', '3']],
-    ['142 TALK', ['142', 'talk']],
-    ['3 no more than that', ['3', 'no', 'more', 'than', 'that']],
-  ]
-  for (const [text, words] of cases) {
+  // His words go to huddle as he wrote them: the bridge maps nothing.
+  const cases = ['142 yes Friday', '142 no', '  142  Not Now Dec 3', '142 TALK', '3 no more than that', '142 keep', '142. defer until Dec 3', '#142 needs discussion']
+  for (const text of cases) {
     const kinds: Record<string, string> = {}
     const rigs = FLEET.map(agent => ({ agent, r: rig(agent, { huddle: { rc: 0, stdout: '142 = Vera: retire the old prompt, yes Friday\n' } }) }))
     for (const { agent, r } of rigs) kinds[agent] = await r.send(text)
     expect(kinds).toEqual({ Vera: 'answer', Grady: 'none', Werner: 'none', Taiichi: 'none', Brody: 'none', Maya: 'none', Page: 'none' })
-    expect(rigs.flatMap(x => x.r.calls)).toEqual([{ argv: [HUDDLE_BIN, 'answer', ...words, '--link', 'https://t.me/c/4286764447/40/3300', '--as', 'Vera'], timeoutMs: HUDDLE_TIMEOUT_MS }])
+    expect(rigs.flatMap(x => x.r.calls)).toEqual([{ argv: [HUDDLE_BIN, 'answer', '--lines', text, '--link', 'https://t.me/c/4286764447/40/3300', '--as', 'Vera'], timeoutMs: HUDDLE_ANSWER_TIMEOUT_MS }])
     expect(rigs.flatMap(x => x.r.posts)).toEqual([{ chat_id: GROUP, text: '142 = Vera: retire the old prompt, yes Friday', thread_id: THREAD, markdown: false }])
   }
   expect(messageLink(GROUP, undefined, 9)).toBe('https://t.me/c/4286764447/9')
@@ -140,7 +135,7 @@ test('huddle answer: each of the four forms from Monty runs huddle answer on the
 
 test('huddle answer: ordinary chat runs nothing, and neither does the same line from anyone but Monty', async () => {
   const v = rig('Vera')
-  for (const text of ['yes', 'yes 142', '142', '142 maybe', '142 yesterday was fine', '142 nope', 'item 142 yes', '142: yes', '/who', 'I have 3 no wait 4 ideas', '142 talking now']) {
+  for (const text of ['yes', 'yes 142', '142', 'item 142 yes', '/who', 'I have 3 no wait 4 ideas', 'see you at 5\nor at 6', '142nd street is fine']) {
     expect(parseHuddleAnswer(text)).toBeUndefined()
     expect(await v.send(text)).toBe('none')
   }
@@ -150,7 +145,23 @@ test('huddle answer: ordinary chat runs nothing, and neither does the same line 
   expect(await v.send('142 yes', { chat_id: DM, chat_type: 'private' })).toBe('none')
   expect(v.calls).toEqual([])
   expect(v.posts).toEqual([])
-  expect(HUDDLE_ANSWER_RE.source).toBe('^\\s*(\\d+)\\s+(yes|no|not now|talk)\\b(.*)$')
+  expect(HUDDLE_ANSWER_RE.source).toBe('^[ \\t]*#?\\d+[.):,]?[ \\t]+\\S')
+})
+
+test('huddle answer: a message of answers goes to huddle whole, its echo is posted whole, and a message huddle calls ordinary chat posts nothing', async () => {
+  const message = 'Here are my answers\n12 keep, the short one\n14 no we have one\n15 defer until Dec 3\n16 hmm what is this'
+  const echo = 'Recorded: 12 yes, 14 no, 15 not now Dec 3\nPassed to the owner as your note, nothing recorded: 16 (Grady)'
+  const v = rig('Vera', { huddle: { rc: 0, stdout: echo + '\n' } })
+  expect(await v.send(message)).toBe('answer')
+  expect(v.calls).toEqual([{ argv: [HUDDLE_BIN, 'answer', '--lines', message, '--link', 'https://t.me/c/4286764447/40/3300', '--as', 'Vera'], timeoutMs: HUDDLE_ANSWER_TIMEOUT_MS }])
+  expect(v.posts).toEqual([{ chat_id: GROUP, text: echo, thread_id: THREAD, markdown: false }])
+  expect(HUDDLE_ANSWER_TIMEOUT_MS).toBe(300000)
+  // A line that opens with a number is asked about; huddle says it is no answer, and nothing is posted.
+  const chat = rig('Vera', { huddle: { rc: 5, stdout: '' } })
+  const plan = planHuddle(chat.planDeps, chat.msg('2026 was a good year'))
+  expect(plan.kind === 'answer' && await runHuddleAnswer(chat.deps, plan)).toBe('none')
+  expect(chat.calls.length).toBe(1)
+  expect(chat.posts).toEqual([])
 })
 
 test('huddle answer: what huddle refuses is posted as it said it, and a huddle that fails gets one failure line', async () => {
@@ -161,7 +172,7 @@ test('huddle answer: what huddle refuses is posted as it said it, and a huddle t
   const dead = rig('Vera', { huddle: { rc: 75, stdout: '', stderr: 'huddle: CANONICAL STORE UNREACHABLE (maxi, from mini).\n' } })
   const plan2 = planHuddle(dead.planDeps, dead.msg('142 no'))
   expect(plan2.kind === 'answer' && await runHuddleAnswer(dead.deps, plan2)).toBe('failed')
-  expect(dead.posts.map(p => p.text)).toEqual(['142 no failed: huddle: CANONICAL STORE UNREACHABLE (maxi, from mini).'])
+  expect(dead.posts.map(p => p.text)).toEqual(['huddle answer failed: huddle: CANONICAL STORE UNREACHABLE (maxi, from mini).'])
 })
 
 test('huddle: the server plans it before the gate, drops a command, and lets an answer go on to the gate', () => {

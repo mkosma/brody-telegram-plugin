@@ -40,16 +40,19 @@ import { WHO_ANSWERER, WHO_HEARS_BIN, WHO_TIMEOUT_MS, type CommandMessage, type 
 
 export const HUDDLE_BIN = join(homedir(), '.local', 'bin', 'huddle')
 export const HUDDLE_TIMEOUT_MS = 60000
+/** A message of answers writes each one into its record in turn; it is never cut off part way for being slow. */
+export const HUDDLE_ANSWER_TIMEOUT_MS = 300000
 export const HUDDLE_MAX_STDOUT = 65536
 export const NOBODY_HERE = 'Nobody hears untagged posts in this topic. Name the agents, or say fleet.'
 const RC_TIMEOUT = 124
 /** huddle's own exit for "nothing was recorded, and here is why": its stdout is the answer. */
 const RC_NOT_RECORDED = 4
+/** huddle's exit for "no line of this message is about a blocker": ordinary chat, nothing to post. */
+const RC_NOT_AN_ANSWER = 5
 const TELEGRAM_TEXT_MAX = 4096
 
 export const HUDDLE_SECTIONS = ['done', 'active', 'next', 'blockers', 'status'] as const
 export type HuddleSection = typeof HUDDLE_SECTIONS[number]
-export type HuddleForm = 'yes' | 'no' | 'not-now' | 'talk'
 
 /** `/blockers vera grady`, `/status@MK_VeraBot fleet`: the section and the words after it, lowercased, without an @. */
 export function parseHuddleCommand(text: string): { section: HuddleSection; names: string[] } | undefined {
@@ -62,14 +65,17 @@ export function parseHuddleCommand(text: string): { section: HuddleSection; name
   return { section: m[1].toLowerCase() as HuddleSection, names }
 }
 
-/** The one shape of an answer. What follows the form is `huddle`'s to read. */
-export const HUDDLE_ANSWER_RE = /^\s*(\d+)\s+(yes|no|not now|talk)\b(.*)$/i
+/**
+ * A line that may answer a blocker: it opens with a number and has words
+ * after it. One message may hold many, one to a line (Monty, 40 msg 3482).
+ * What the words mean is `huddle`'s to read, in one place: this only decides
+ * whether to ask it.
+ */
+export const HUDDLE_ANSWER_RE = /^[ \t]*#?\d+[.):,]?[ \t]+\S/m
 
-export function parseHuddleAnswer(text: string): { number: string; form: HuddleForm; rest: string[] } | undefined {
-  const m = HUDDLE_ANSWER_RE.exec(text)
-  if (!m) return undefined
-  const form = m[2].toLowerCase().replace(/\s+/g, '-') as HuddleForm
-  return { number: m[1], form, rest: m[3].trim().split(/\s+/).filter(w => w.length > 0) }
+/** His message, whole, when any line of it may answer a blocker. */
+export function parseHuddleAnswer(text: string): { text: string } | undefined {
+  return HUDDLE_ANSWER_RE.test(text) ? { text } : undefined
 }
 
 export type HuddleMessage = CommandMessage & { message_id?: number }
@@ -81,7 +87,7 @@ export type HuddlePlan =
   | { kind: 'ignore' }
   | { kind: 'section'; section: HuddleSection; names: string[]; chat_id: string; thread_id?: number; key: string; flat?: true }
   /** His answer, on the answerer's bridge. The message still goes to the gate. */
-  | { kind: 'answer'; number: string; form: HuddleForm; rest: string[]; chat_id: string; thread_id?: number; link?: string }
+  | { kind: 'answer'; text: string; chat_id: string; thread_id?: number; link?: string }
 
 export type HuddlePlanDeps = { agent: string; loadAccess: () => { allowFrom: string[] } }
 
@@ -193,18 +199,20 @@ export async function runHuddleSection(deps: HuddleDeps, plan: Extract<HuddlePla
 }
 
 /**
- * Record his answer: `huddle answer <number> <form> <his words> --link <his
- * message> --as <agent>`, and post the one line it prints. Resolves
- * 'recorded', 'refused' (huddle recorded nothing and said why) or 'failed'.
+ * Record his answers: `huddle answer --lines <his message> --link <his
+ * message> --as <agent>`, and post what it prints, whole. Resolves
+ * 'recorded', 'refused' (huddle recorded nothing and said why), 'failed', or
+ * 'none' (no line was about a blocker: nothing is posted).
  */
-export async function runHuddleAnswer(deps: HuddleDeps, plan: Extract<HuddlePlan, { kind: 'answer' }>): Promise<'recorded' | 'refused' | 'failed'> {
+export async function runHuddleAnswer(deps: HuddleDeps, plan: Extract<HuddlePlan, { kind: 'answer' }>): Promise<'recorded' | 'refused' | 'failed' | 'none'> {
   const stderr = deps.stderr ?? ((l: string) => { process.stderr.write(l) })
-  const argv = [deps.bin ?? HUDDLE_BIN, 'answer', plan.number, plan.form, ...plan.rest, ...(plan.link ? ['--link', plan.link] : []), ...(deps.agent && deps.agent !== '<Agent>' ? ['--as', deps.agent] : [])]
-  const r = await deps.run(argv, deps.timeoutMs ?? HUDDLE_TIMEOUT_MS)
-  const line = r.stdout.trim().split('\n')[0] ?? ''
+  const argv = [deps.bin ?? HUDDLE_BIN, 'answer', '--lines', plan.text, ...(plan.link ? ['--link', plan.link] : []), ...(deps.agent && deps.agent !== '<Agent>' ? ['--as', deps.agent] : [])]
+  const r = await deps.run(argv, deps.timeoutMs ?? HUDDLE_ANSWER_TIMEOUT_MS)
+  if (r.rc === RC_NOT_AN_ANSWER) return 'none'
+  const line = r.stdout.trim()
   const result = r.rc === 0 && line.length > 0 ? 'recorded' : r.rc === RC_NOT_RECORDED && line.length > 0 ? 'refused' : 'failed'
   if (result === 'failed') stderr(`telegram channel: huddle answer failed: rc=${r.rc} ${r.stderr}\n`)
-  const text = line.length > 0 ? line.slice(0, TELEGRAM_TEXT_MAX) : failure(`${plan.number} ${plan.form}`, r.rc, r.rc === 0 ? 'no output' : r.stderr)
+  const text = line.length > 0 ? line.slice(0, TELEGRAM_TEXT_MAX) : failure('huddle answer', r.rc, r.rc === 0 ? 'no output' : r.stderr)
   try {
     await deps.post(plan.chat_id, text, plan.thread_id, false)
   } catch (err) {
