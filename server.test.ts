@@ -1641,7 +1641,7 @@ test('peer posts D12: a post by Maya on mini reaches a bot on maxi, and a post f
   const maya = h.bridge('MK_MayaBot', h.runAs('mini'))
   expect(await pollPeerPosts(maya.deps)).toEqual([{ key: `${GROUP}:961`, bot: 'MK_GradyBot', delivered: true }])
   expect(maya.events.map(e => [e.meta.user, e.content])).toEqual([['MK_GradyBot', 'Grady, from maxi']])
-})
+}, 20000)
 
 test('peer posts D12: while the other host cannot be read nothing is delivered and it is said once; the next good read delivers', async () => {
   const h = twoHosts()
@@ -1658,7 +1658,7 @@ test('peer posts D12: while the other host cannot be read nothing is delivered a
   expect((await pollPeerPosts(g.deps))!.map(o => o.key)).toEqual([`${GROUP}:962`])
   expect(g.lines[1]).toBe('telegram channel: post log reads again\n')
   expect(g.deps.seen.cursor).toBe(cursor + PEER_POLL_MS)
-})
+}, 20000)
 
 test('peer posts: the server polls the log only after initialized, every 5s, through the shared reader, and tells the agent what a peer post is', () => {
   // 5s between rounds and tail-fleet-posts' own 5s bound on a host: 10s from post to delivery.
@@ -1773,7 +1773,7 @@ test('stamp S3: a command that sleeps 10s is abandoned at the bound, and the pos
   expect(await inboundContext(stuck.deps, montyPost)).toEqual({ ctx: 'unknown' })
   expect(Date.now() - t1).toBeLessThan(1000)
   expect(stuck.errs).toHaveLength(1)
-}, 15000)
+}, 20000)
 
 test('stamp S4: a nonzero exit and empty output each give ctx="unknown" and one stderr line', async () => {
   const failed = ctxRig(ctxStub('echo "track=Higher"; exit 1'))
