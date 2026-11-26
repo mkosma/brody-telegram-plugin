@@ -24,6 +24,8 @@ PN6-PN7 (silent failure on the missing right).
 Extended for BRIEF-reactions-reach-only-the-poster-2026-11-24 (ids OS*): a
 reaction reaches the session only on this bot's own message, a pin it holds
 or a private chat.
+Extended for DESIGN-huddle-2026-11-26 (ids HD*): the five huddle commands
+and his numbered answer, in huddle.ts.
 
 The baseline includes "presence D6", which loads Vera's who-hears from the
 agents repo and requires it to agree with the gate. To run against a copy of
@@ -1001,6 +1003,43 @@ REVERTS = [
      "  if (!deps.own.seeded) return 'unseeded'\n",
      "",
      "own sent: an unreadable post log delivers everything and says so in one line"),
+    # DESIGN-huddle-2026-11-26 (huddle.ts)
+    ("HD1", "huddle answerer", "huddle.ts",
+     "    if (!his || !answerer) return { kind: 'ignore' }\n",
+     "    if (!his) return { kind: 'ignore' }\n",
+     "huddle: each of the five commands from Monty makes the answerer run huddle once with the names, and every other bridge drops it"),
+    ("HD2", "huddle authority", "huddle.ts",
+     "    if (!his || !answerer) return { kind: 'ignore' }\n",
+     "    if (!answerer) return { kind: 'ignore' }\n",
+     "huddle: a command from anyone but Monty runs nothing and is dropped"),
+    ("HD3", "huddle answer authority", "huddle.ts",
+     "  if (!ans || !his || !answerer) return { kind: 'none' }\n",
+     "  if (!ans || !answerer) return { kind: 'none' }\n",
+     "huddle answer: ordinary chat runs nothing, and neither does the same line from anyone but Monty"),
+    ("HD4", "huddle answer shape", "huddle.ts",
+     "(yes|no|not now|talk)\\b(.*)$/i",
+     "(yes|no|not now|talk)(.*)$/i",
+     "huddle answer: ordinary chat runs nothing, and neither does the same line from anyone but Monty"),
+    ("HD5", "huddle default set", "huddle.ts",
+     "  if (names.length === 0) {\n    const w = await deps.run(",
+     "  if (false) {\n    const w = await deps.run(",
+     "huddle: a command with no names asks who-hears for this topic, as /who does, and names those agents"),
+    ("HD6", "huddle wiring", "server.ts",
+     "  if (huddle.kind === 'answer') void runHuddleAnswer(huddleDeps, huddle)\n",
+     "",
+     "huddle: the server plans it before the gate, drops a command, and lets an answer go on to the gate"),
+    ("HD7", "huddle plain fallback", "huddle.ts",
+     "        await deps.post(plan.chat_id, unescapeMarkdown(text), plan.thread_id, false)",
+     "        await deps.post(plan.chat_id, text, plan.thread_id, false)",
+     "huddle: a huddle that fails gets one plain failure line, and a refused MarkdownV2 post is sent again as plain text"),
+    ("HD8", "huddle answer sender", "huddle.ts",
+     ", ...(deps.agent && deps.agent !== '<Agent>' ? ['--as', deps.agent] : [])]",
+     "]",
+     "huddle answer: each of the four forms from Monty runs huddle answer on the answerer alone, with his words, his message link and the agent"),
+    ("HD9", "huddle answerer for answers", "huddle.ts",
+     "  if (!ans || !his || !answerer) return { kind: 'none' }\n",
+     "  if (!ans || !his) return { kind: 'none' }\n",
+     "huddle answer: each of the four forms from Monty runs huddle answer on the answerer alone, with his words, his message link and the agent"),
 ]
 
 FAIL_RE = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)

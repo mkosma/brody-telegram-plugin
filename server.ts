@@ -33,6 +33,7 @@ import { join, sep, basename } from 'path'
 import { tapToast, type TapOutcome } from './tap-toast.ts'
 import { runReply, runEditMessage } from './reply.ts'
 import { makeTee, teeInbound, safeTee, outEntry, isGroupChatId, TEE_DIR } from './post-log.ts'
+import { planHuddle, runHuddleSection, runHuddleAnswer, type HuddleDeps, type HuddlePlan } from './huddle.ts'
 import { planGroupCommand, planMentionInvite, runGroupCommand, sayGroupCommand, runWho, spawnOutput, type CommandDeps, type CommandPlan, type CommandMessage } from './invite-excuse.ts'
 import { PhrasePicker, phrasesFile } from './phrases.ts'
 import { type GroupPolicy } from './group-gate.ts'
@@ -1397,6 +1398,21 @@ function commandDeps(ctx: Context, text: string): CommandDeps<Access> {
   }
 }
 
+// The huddle's posts (huddle.ts). A section is MarkdownV2 from `huddle`; an
+// answer's echo is plain. Logged like every other post this bridge makes.
+const huddleDeps: HuddleDeps = {
+  agent: ACCESS_AGENT,
+  run: spawnOutput,
+  post: async (chat_id, text, thread_id, markdown) => {
+    const sent = await bot.api.sendMessage(chat_id, text, {
+      ...(thread_id != null ? { message_thread_id: thread_id } : {}),
+      ...(markdown ? { parse_mode: 'MarkdownV2' as const } : {}),
+      link_preview_options: { is_disabled: true },
+    })
+    safeTee(tee, outEntry({ chat_id, thread_id, message_id: sent.message_id, text, edit: false }))
+  },
+}
+
 // Inbound context stamp (inbound-context.ts): Monty's posts only, and only
 // for an agent that set TELEGRAM_INBOUND_CONTEXT_CMD.
 const contextDeps: ContextDeps = {
@@ -1449,6 +1465,19 @@ async function handleInbound(
     if (command.kind === 'act') await runGroupCommand(deps, command)
     return
   }
+
+  // The huddle (huddle.ts): /done, /active, /next, /blockers and /status are
+  // answered before gate() by the one bridge that answers /who, and dropped by
+  // every other. His `<number> yes|no|not now|talk` runs `huddle answer` on
+  // that bridge, and the message still goes on to the gate as chat.
+  const huddle: HuddlePlan = commandMessage ? planHuddle(deps, { ...commandMessage, message_id: ctx.message?.message_id }) : { kind: 'none' }
+  if (huddle.kind === 'section' || huddle.kind === 'ignore') {
+    teeInbound(teeArgs, () => ({ action: 'drop' }))
+    // Not awaited: huddle may take its whole bound, and updates are handled in turn.
+    if (huddle.kind === 'section') void runHuddleSection(huddleDeps, huddle)
+    return
+  }
+  if (huddle.kind === 'answer') void runHuddleAnswer(huddleDeps, huddle)
 
   // A mention from Monty in a forum topic this bot is absent from is an
   // /invite (invite-excuse.ts): the same plan, applied by the same code, and
