@@ -32,6 +32,7 @@ import { homedir } from 'os'
 import { join, sep, basename } from 'path'
 import { tapToast, type TapOutcome } from './tap-toast.ts'
 import { runReply, runEditMessage, runReact } from './reply.ts'
+import { huddleLinksReader } from './links.ts'
 import { assertOutboundChat, exempt, refusePrivateChat } from './private-chat.ts'
 import { makeTee, teeInbound, safeTee, outEntry, isGroupChatId, TEE_DIR } from './post-log.ts'
 import { planHuddle, runHuddleSection, runHuddleAnswer, type HuddleDeps, type HuddlePlan } from './huddle.ts'
@@ -442,6 +443,8 @@ const mcp = new Server(
       '',
       'The FIRST thing to do on an inbound message in a group is call react with \u{1F440} on its message_id. That is the sender\'s only signal that a live agent has actually read it: nothing in the transport reacts on your behalf, by design, because a transport-level reaction cannot tell "an agent read this" apart from "the bot process is running." React first, then do the work.',
       '',
+      'Refer to Monty\'s numbered items as #47 and to GitHub issues as repo#123 (agents#123, monty-ops#123, deck#123, or owner/repo#123 for any other repo). The bridge turns each into a link when reply or edit_message sends it: an item to its message, while that item is open, and an issue to GitHub. Do not build those links yourself, and in markdownv2 escape the # as you would any other.',
+      '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
       'Reaction events arrive as <channel source="telegram" type="reaction" chat_id="..." message_id="..." user="..." reaction="..." action="added|removed" ts="..."/>. A reaction on a message is a lightweight confirmation signal — treat 👍 as "yes/proceed", 👎 as "no/cancel" unless context suggests otherwise.',
@@ -537,7 +540,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, message_thread_id for forum topic routing, reply_markup for inline keyboard buttons, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Refer to Monty\'s items as #47 and to issues as repo#123; the bridge links them. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, message_thread_id for forum topic routing, reply_markup for inline keyboard buttons, and files (absolute paths) to attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -714,13 +717,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }))
 
+// huddle's published links, read at each reply and edit (links.ts).
+const huddleLinks = huddleLinksReader()
+
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
     switch (req.params.name) {
       case 'reply':
         return await runReply(
-          { api: bot.api, loadAccess, assertAllowedChat, assertSendable, stopTyping, tee, relay, sent: p => sentPosts.note(p.chat_id, p.message_id, { text: p.text, thread_id: p.thread_id }) },
+          { api: bot.api, loadAccess, assertAllowedChat, assertSendable, stopTyping, tee, relay, links: huddleLinks, sent: p => sentPosts.note(p.chat_id, p.message_id, { text: p.text, thread_id: p.thread_id }) },
           args,
         )
       case 'react':
@@ -744,7 +750,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: path }] }
       }
       case 'edit_message':
-        return await runEditMessage({ api: bot.api, assertAllowedChat, tee }, args)
+        return await runEditMessage({ api: bot.api, assertAllowedChat, tee, links: huddleLinks }, args)
       case 'create_forum_topic':
         // Feature 1: create a new forum topic; the creator is present in it (forum-topic.ts).
         return await runCreateForumTopic({ api: bot.api, assertAllowedChat, isStatic: STATIC, loadAccess, saveAccess }, args)

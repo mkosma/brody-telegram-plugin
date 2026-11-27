@@ -12,6 +12,7 @@ import { basename, extname } from 'path'
 import { InputFile } from 'grammy'
 import { isGroupChatId, outEntry, safeTee, type Tee } from './post-log.ts'
 import type { RelayOutcome, RelayRequest } from './tag-relay.ts'
+import { linkChunks, linkOptions, type HuddleLinks } from './links.ts'
 
 export const MAX_CHUNK_LIMIT = 4096
 export const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -50,6 +51,12 @@ export type ReplyDeps = {
   relay?: (req: RelayRequest) => Promise<RelayOutcome[]> | undefined
   /** Test hook: handed the background work (relay, then log) when there is some. */
   settled?: (work: Promise<void>) => void
+  /**
+   * huddle's published links, read once per reply (links.ts). Absent, or
+   * undefined for a file that could not be read, links no items; issue
+   * references are linked either way.
+   */
+  links?: () => Promise<HuddleLinks | undefined>
   /** Told of each text message sent, so pin_message knows this bot's own posts (pin.ts). */
   sent?: (post: { chat_id: string; thread_id: number | undefined; message_id: number; text: string }) => void
 }
@@ -106,6 +113,11 @@ export function chunk(text: string, limit: number, mode: 'length' | 'newline'): 
   return out
 }
 
+/** The links file, or undefined: a reader that throws links no items and fails no send. */
+async function readLinks(links: ReplyDeps['links']): Promise<HuddleLinks | undefined> {
+  try { return await links?.() } catch { return undefined }
+}
+
 export async function runReply(
   deps: ReplyDeps,
   args: Record<string, unknown>,
@@ -151,6 +163,9 @@ export async function runReply(
   const mode = access.chunkMode ?? 'length'
   const replyMode = access.replyToMode ?? 'first'
   const chunks = chunk(text, limit, mode)
+  // His items and issue references become links here (links.ts). The log, the
+  // relay and the pin record keep the text the agent wrote.
+  const linked = linkChunks(text, chunks, await readLinks(deps.links), parseMode !== undefined, MAX_CHUNK_LIMIT)
   const sentIds: number[] = []
   const posts: SentPost[] = []
 
@@ -189,9 +204,10 @@ export async function runReply(
           (replyMode === 'all' || i === 0)
         // Attach keyboard only to the first (or only) chunk.
         const chunkKeyboard = i === 0 ? grammyKeyboard : undefined
-        const sent = await api.sendMessage(chat_id, chunks[i], {
+        const sent = await api.sendMessage(chat_id, linked[i].text, {
           ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
           ...(parseMode ? { parse_mode: parseMode } : {}),
+          ...linkOptions(linked[i]),
           ...(message_thread_id != null ? { message_thread_id } : {}),
           ...(chunkKeyboard ? { reply_markup: chunkKeyboard } : {}),
         })
@@ -301,18 +317,22 @@ export type EditApi = {
 }
 
 export async function runEditMessage(
-  deps: { api: EditApi; assertAllowedChat: (chat_id: string) => void; tee?: Tee },
+  deps: { api: EditApi; assertAllowedChat: (chat_id: string) => void; tee?: Tee; links?: ReplyDeps['links'] },
   args: Record<string, unknown>,
 ): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
   const chat_id = args.chat_id as string
   deps.assertAllowedChat(chat_id)
   const editFormat = (args.format as string | undefined) ?? 'text'
   const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
+  // Linked as a reply is (links.ts). The log keeps the text the agent wrote.
+  const text = args.text as string
+  const [linked] = linkChunks(text, [text], await readLinks(deps.links), editParseMode !== undefined, MAX_CHUNK_LIMIT)
+  const other = { ...(editParseMode ? { parse_mode: editParseMode } : {}), ...linkOptions(linked) }
   const edited = await deps.api.editMessageText(
     chat_id,
     Number(args.message_id),
-    args.text as string,
-    ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
+    linked.text,
+    ...(Object.keys(other).length ? [other] : []),
   )
   const id = typeof edited === 'object' ? edited.message_id : args.message_id
   if (isGroupChatId(chat_id)) {
