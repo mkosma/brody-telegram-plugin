@@ -1,4 +1,4 @@
-// The bridge links every item and issue reference (links.ts).
+// The bridge links every item and issue reference (outbound.ts).
 // Design: agents/Grady/design/DESIGN-bridge-links-references-2026-11-27, item
 // 4: each form linked; a closed or unknown number left plain; a number in a
 // code span or URL left plain; a missing file sends unchanged; MarkdownV2
@@ -14,8 +14,8 @@ import { test, expect, afterAll, setDefaultTimeout } from 'bun:test'
 import { mkdtempSync, mkdirSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { runReply, runEditMessage, type ReplyDeps } from './reply.ts'
-import { ISSUE_REPOS, findRefs, huddleLinksReader, type HuddleLinks } from './links.ts'
+import { runReply, runEditMessage, type ReplyDeps } from './outbound.ts'
+import { ISSUE_REPOS, findRefs, huddleLinksReader, type HuddleLinks } from './outbound.ts'
 import { TAIL_FLEET_POSTS_BIN } from './peer-posts.ts'
 
 setDefaultTimeout(30_000)

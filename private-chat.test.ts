@@ -1,4 +1,4 @@
-// The bridge refuses a post into a private chat (private-chat.ts).
+// The bridge refuses a post into a private chat (outbound.ts).
 // Design: agents/Grady/design/DESIGN-bridge-refuses-bot-dms-2026-11-27, drill
 // item 4: a reply, edit and react to his DM are refused with the error that
 // names the home; the same in the FLEET group pass; each listed exemption
@@ -16,8 +16,8 @@ import { Api } from 'grammy'
 import {
   PRIVATE_CHAT_REFUSAL, PRIVATE_CHAT_EXEMPTIONS, assertOutboundChat, exempt, isPrivateChatId, refusePrivateChat,
   type PrivateChatExemption,
-} from './private-chat.ts'
-import { runReply, runEditMessage, runReact } from './reply.ts'
+} from './outbound.ts'
+import { runReply, runEditMessage, runReact } from './outbound.ts'
 import { SentPosts, filePinStore, runPinMessage, runUnpinMessage, type PinApi, type PinDeps } from './pin.ts'
 import { runCreateForumTopic, runEditForumTopic } from './forum-topic.ts'
 import { TAIL_FLEET_POSTS_BIN } from './peer-posts.ts'

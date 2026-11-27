@@ -76,7 +76,7 @@ test('generic callback path never answers a tap with no text', () => {
 import { mkdtempSync, existsSync, statSync as fsStat } from 'fs'
 import { tmpdir } from 'os'
 import * as realFs from 'fs'
-import { runReply, runEditMessage } from './reply.ts'
+import { runReply, runEditMessage } from './outbound.ts'
 import { makeTee, teeInbound, type TeeFs } from './post-log.ts'
 
 const GROUP = '-1004286764447'

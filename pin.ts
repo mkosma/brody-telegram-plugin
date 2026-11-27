@@ -140,7 +140,7 @@ export type PinApi = {
 export type PinDeps = {
   api: PinApi
   assertAllowedChat: (chat_id: string) => void
-  /** unpin_message's gate: it alone may name a private chat (private-chat.ts, 'pin-release'). Absent, the tools share one gate. */
+  /** unpin_message's gate: it alone may name a private chat (outbound.ts, 'pin-release'). Absent, the tools share one gate. */
   assertUnpinChat?: (chat_id: string) => void
   sent: SentPosts
   store: PinStore

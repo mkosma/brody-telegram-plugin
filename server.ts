@@ -13,7 +13,7 @@
  *   - Feature 2: Reactions support — message_reaction events surfaced as channel blocks
  *   - Feature 3: Inline keyboards — reply_markup on outbound, callback_query events for general use
  *   - Pins: pin_message / unpin_message / list_pins, released on Monty's answer (pin.ts)
- *   - Copy buttons: copy_text on an inline button (reply.ts)
+ *   - Copy buttons: copy_text on an inline button (outbound.ts)
  *   - Button state: a tapped button is marked in the message's keyboard (button-state.ts)
  */
 
@@ -31,9 +31,9 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, renameSync
 import { homedir } from 'os'
 import { join, sep, basename } from 'path'
 import { tapToast, type TapOutcome } from './tap-toast.ts'
-import { runReply, runEditMessage, runReact } from './reply.ts'
-import { huddleLinksReader } from './links.ts'
-import { assertOutboundChat, exempt, refusePrivateChat } from './private-chat.ts'
+import { runReply, runEditMessage, runReact } from './outbound.ts'
+import { huddleLinksReader } from './outbound.ts'
+import { assertOutboundChat, exempt, refusePrivateChat } from './outbound.ts'
 import { makeTee, teeInbound, safeTee, outEntry, isGroupChatId, TEE_DIR } from './post-log.ts'
 import { planHuddle, runHuddleSection, runHuddleAnswer, type HuddleDeps, type HuddlePlan } from './huddle.ts'
 import { planGroupCommand, planMentionInvite, runGroupCommand, sayGroupCommand, runWho, spawnOutput, type CommandDeps, type CommandPlan, type CommandMessage } from './invite-excuse.ts'
@@ -133,7 +133,7 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const bot = new Bot(TOKEN, process.env.TELEGRAM_API_ROOT ? { client: { apiRoot: process.env.TELEGRAM_API_ROOT } } : {})
 let botUsername = ''
 
-// No post into a private chat (private-chat.ts). Installed on the bot's API so
+// No post into a private chat (outbound.ts). Installed on the bot's API so
 // it sees every call this bridge makes, the handlers' ctx calls included: a
 // send path nobody gated is refused, not allowed. The exemptions are named in
 // that file, and each call site that is one says which.
@@ -182,7 +182,7 @@ const peerLimiter = new PeerLimiter()
 // whole turn. Scoped per chat_id and ONLY between inbound and reply, so it never
 // shows during autonomous/background work (which has no inbound to start it).
 // Never in a private chat: no reply can land there, and the API refuses the
-// chat action like any other post into one (private-chat.ts).
+// chat action like any other post into one (outbound.ts).
 const TYPING_EVERY_MS = 4_000
 const TYPING_MAX_MS = 4 * 60_000
 const typingTimers = new Map<string, { interval: ReturnType<typeof setInterval>; cap: ReturnType<typeof setTimeout> }>()
@@ -302,7 +302,7 @@ function loadAccess(): Access {
 }
 
 // Outbound gate: a tool can post only into a group the inbound gate would
-// deliver from, and never into a private chat (private-chat.ts). A DM's
+// deliver from, and never into a private chat (outbound.ts). A DM's
 // chat_id is the user's id, so allowFrom used to let every tool into his DM.
 function assertAllowedChat(chat_id: string): void {
   assertOutboundChat(loadAccess(), chat_id, ACCESS_CMD)
@@ -717,7 +717,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }))
 
-// huddle's published links, read at each reply and edit (links.ts).
+// huddle's published links, read at each reply and edit (outbound.ts).
 const huddleLinks = huddleLinksReader()
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {

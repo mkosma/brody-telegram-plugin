@@ -16,7 +16,7 @@ import {
   INTERRUPT_BIN, PIN_AGE_MS, PIN_QUESTION_MAX, type Pin, type PinApi, type PinDeps, type SweepDeps,
 } from './pin.ts'
 import { chosenKeyboard, markTapped, frozenToast, showsOrOpens, FROZEN_DATA } from './button-state.ts'
-import { runReply, copyTextProblem, COPY_TEXT_MAX } from './reply.ts'
+import { runReply, copyTextProblem, COPY_TEXT_MAX } from './outbound.ts'
 import { serveAlertTap, type AlertTapDeps } from './alert-tap.ts'
 import { TAIL_FLEET_POSTS_BIN } from './peer-posts.ts'
 
