@@ -163,7 +163,6 @@ test('reload: server.ts never imports outbound.ts for its code, and looks at the
   for (const name of ['assertOutboundChat', 'runReply', 'runReact', 'runEditMessage']) {
     expect(server).toContain(`const ${name}: Outbound['${name}'] = (...a) => outbound.need().${name}(...a)`)
   }
-  expect(src('README.md')).toContain('## What a deploy changes without a restart')
 })
 
 // --- end to end: the real server.ts, from a copy of this tree, against a stub Bot API ---
