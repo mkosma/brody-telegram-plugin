@@ -46,7 +46,7 @@
  * this refuses on its own as well. If it cannot tell, it refuses.
  */
 
-import { Api, Context, GrammyError, HttpError } from 'grammy'
+import { Api, Context, GrammyError, HttpError, type Transformer } from 'grammy'
 import type { Update, UserFromGetMe } from 'grammy/types'
 import { spawnSync } from 'child_process'
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'fs'
@@ -56,6 +56,7 @@ import { ALLOWED_UPDATES, everyoneTagged, inboundDecision, inboundText, parseEnv
 import { threadKey } from './group-gate.ts'
 import { applyGroupCommand, planGroupCommand, planMentionInvite, type CommandDeps, type CommandPlan } from './invite-excuse.ts'
 import { makeTee, outEntry, safeTee, teeInbound, isGroupChatId, TEE_DIR, type Tee } from './post-log.ts'
+import { exempt, refusePrivateChat } from './private-chat.ts'
 
 export const EXIT = { NOTHING: 0, USAGE: 2, PEEK_FAILED: 3, REFUSED: 4, DELIVER: 10 } as const
 
@@ -282,7 +283,8 @@ async function acknowledge(
   try { prev = JSON.parse(readFileSync(ackFile, 'utf8')) } catch {}
   if (prev?.update_id === update_id) return 'already'
   try {
-    const sent = await api.sendMessage(ack.chat_id, ACK_TEXT, ack.thread_id != null ? { message_thread_id: ack.thread_id } : {})
+    // In a DM this is the 'wake-ack' exemption (private-chat.ts).
+    const sent = await api.sendMessage(ack.chat_id, ACK_TEXT, { ...(ack.thread_id != null ? { message_thread_id: ack.thread_id } : {}), ...exempt('wake-ack') })
     if (isGroupChatId(ack.chat_id)) {
       safeTee(tee, outEntry({ chat_id: ack.chat_id, thread_id: ack.thread_id, message_id: sent.message_id, text: ACK_TEXT, edit: false }))
     }
@@ -341,6 +343,8 @@ export async function main(argv: string[], io = {
     ...(process.env.WAKE_CHECK_API_ROOT ? { apiRoot: process.env.WAKE_CHECK_API_ROOT } : {}),
     timeoutSeconds: 8,
   })
+  // No post into a private chat but a named exemption (private-chat.ts).
+  api.config.use(refusePrivateChat as Transformer)
 
   let me: UserFromGetMe
   try {

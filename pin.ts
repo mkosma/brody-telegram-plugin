@@ -140,6 +140,8 @@ export type PinApi = {
 export type PinDeps = {
   api: PinApi
   assertAllowedChat: (chat_id: string) => void
+  /** unpin_message's gate: it alone may name a private chat (private-chat.ts, 'pin-release'). Absent, the tools share one gate. */
+  assertUnpinChat?: (chat_id: string) => void
   sent: SentPosts
   store: PinStore
   stderr: (s: string) => void
@@ -229,7 +231,7 @@ export async function runPinMessage(deps: PinDeps, args: Record<string, unknown>
 export async function runUnpinMessage(deps: PinDeps, args: Record<string, unknown>): Promise<ToolResult> {
   const chat_id = String(args.chat_id)
   const message_id = Number(args.message_id)
-  deps.assertAllowedChat(chat_id)
+  ;(deps.assertUnpinChat ?? deps.assertAllowedChat)(chat_id)
   const pins = deps.store.load()
   if (!pins.some(p => same(p, chat_id, message_id))) {
     return refused(`unpin_message refused: this bot has no pin on record for message ${message_id} in that chat. It unpins only what it pinned; list_pins shows those.`)

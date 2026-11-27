@@ -33,6 +33,12 @@ Each bot keeps its state in its own state dir: the `TELEGRAM_STATE_DIR` that its
 
 There is no command to change `dmPolicy` yet. Edit `"dmPolicy"` by hand in that bot's `access.json`; the bridge picks it up on the next message. `edit-telegram-access <Agent> list` shows the current value.
 
+## A DM is inbound only
+
+A sender on the allowlist can DM the bot and the message reaches the session. The bot does not answer there. `reply`, `edit_message`, `react`, `pin_message` and the topic tools refuse a private chat with "Monty's DM is not a work channel: post in the FLEET topic where the work is.", and the bridge's own API layer refuses any other post into one.
+
+The few paths that still post into a DM are named, each with its reason, in `PRIVATE_CHAT_EXEMPTIONS` in `private-chat.ts`: pairing, the `/start` `/help` `/status` answers, the permission prompt, the answer to a button tapped there, taking down a pin already there, and the wake acknowledgement. There is no setting and no tool argument that adds one.
+
 ## User IDs
 
 Telegram identifies users by **numeric IDs** like `412587349`. Usernames are optional and mutable; numeric IDs are permanent. The allowlist stores numeric IDs.

@@ -274,6 +274,23 @@ export async function runReply(
   return { content: [{ type: 'text', text: result }] }
 }
 
+export type ReactApi = {
+  setMessageReaction(chat_id: string, message_id: number, reaction: Array<{ type: 'emoji'; emoji: string }>): Promise<true>
+}
+
+/** The react tool. Gated like every outbound tool: never into a private chat (private-chat.ts). */
+export async function runReact(
+  deps: { api: ReactApi; assertAllowedChat: (chat_id: string) => void },
+  args: Record<string, unknown>,
+): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+  const chat_id = args.chat_id as string
+  deps.assertAllowedChat(chat_id)
+  await deps.api.setMessageReaction(chat_id, Number(args.message_id), [
+    { type: 'emoji', emoji: args.emoji as string },
+  ])
+  return { content: [{ type: 'text', text: 'reacted' }] }
+}
+
 export type EditApi = {
   editMessageText(
     chat_id: string,

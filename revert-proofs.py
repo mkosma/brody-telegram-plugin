@@ -26,6 +26,8 @@ reaction reaches the session only on this bot's own message, a pin it holds
 or a private chat.
 Extended for DESIGN-huddle-2026-11-26 (ids HD*): the five huddle commands
 and his numbered answer, in huddle.ts.
+Extended for DESIGN-bridge-refuses-bot-dms-2026-11-27 (ids DM*): no post into
+a private chat but a named exemption, in private-chat.ts.
 
 The baseline includes "presence D6", which loads Vera's who-hears from the
 agents repo and requires it to agree with the gate. To run against a copy of
@@ -36,6 +38,11 @@ symlinked in), never to the tree itself. A revert whose text is not found
 exactly once is an error, not a pass: a revert that changes nothing proves
 nothing. For each one the script runs `bun test` and requires (a) a nonzero
 exit and (b) the named test among the failures.
+
+REVERT_PROOFS_FILES names the test files to run, space-separated, for the
+baseline and for every revert alike; unset, the whole suite runs. The named
+test must still be among the failures, so a file list that leaves its test
+out reports MISS, never a pass.
 
 Usage: ./revert-proofs.py [ID ...]     exit 0 when every revert went red.
 """
@@ -1052,6 +1059,84 @@ REVERTS = [
      "  if (!ans || !his || !answerer) return { kind: 'none' }\n",
      "  if (!ans || !his) return { kind: 'none' }\n",
      "huddle answer: each of the four forms from Monty runs huddle answer on the answerer alone, with his words, his message link and the agent"),
+    # DESIGN-bridge-refuses-bot-dms-2026-11-27 (ids DM*): no post into a private
+    # chat but a named exemption. Drill: private-chat.test.ts.
+    ('DM1', 'DM refused by the tools', 'private-chat.ts',
+     '    if (exemption === undefined || !Object.hasOwn(PRIVATE_CHAT_EXEMPTIONS, exemption)) throw new Error(PRIVATE_CHAT_REFUSAL)\n',
+     '',
+     'private chat: reply, edit_message, react, pin_message and the topic tools to his DM are refused with the line that names the home, and nothing is sent'),
+    ('DM2', 'the refusal names the home', 'private-chat.ts',
+     'export const PRIVATE_CHAT_REFUSAL = "Monty\'s DM is not a work channel: post in the FLEET topic where the work is."',
+     "export const PRIVATE_CHAT_REFUSAL = 'chat is not allowlisted'",
+     'private chat: reply, edit_message, react, pin_message and the topic tools to his DM are refused with the line that names the home, and nothing is sent'),
+    ('DM3', 'react is gated', 'reply.ts',
+     '  deps.assertAllowedChat(chat_id)\n  await deps.api.setMessageReaction(',
+     '  await deps.api.setMessageReaction(',
+     'private chat: reply, edit_message, react, pin_message and the topic tools to his DM are refused with the line that names the home, and nothing is sent'),
+    ('DM4', 'tool error is the line alone', 'server.ts',
+     'function assertAllowedChat(chat_id: string): void {\n  assertOutboundChat(loadAccess(), chat_id, ACCESS_CMD)\n}',
+     "function assertAllowedChat(chat_id: string): void {\n  const a = loadAccess()\n  if (!a.allowFrom.includes(chat_id) && !(chat_id in a.groups)) throw new Error('not allowlisted')\n}",
+     'end to end: reply, edit_message, react and pin_message to his DM come back as the refusal and ask Telegram nothing; the same in the FLEET group go out'),
+    ('DM5', 'API layer refuses a DM', 'private-chat.ts',
+     "  if (isPrivateChatId(p.chat_id) && !method.startsWith('get') && !exemptionCovers(p[EXEMPT], method)) {",
+     '  if (false) {',
+     'private chat: every call that posts into a private chat is refused by the API layer, and one into a group or a read passes'),
+    ('DM6', 'API layer passes a read', 'private-chat.ts',
+     "isPrivateChatId(p.chat_id) && !method.startsWith('get') && ",
+     'isPrivateChatId(p.chat_id) && ',
+     'private chat: every call that posts into a private chat is refused by the API layer, and one into a group or a read passes'),
+    ('DM7', 'API layer on the bot', 'server.ts',
+     'bot.api.config.use(refusePrivateChat as Transformer)\n',
+     '',
+     'end to end: his DM still reaches the session, and the bridge posts nothing into it, not even "typing"; a group post still shows typing'),
+    ('DM8', 'exemption covers its methods only', 'private-chat.ts',
+     '  return (PRIVATE_CHAT_EXEMPTIONS[name as PrivateChatExemption].methods as readonly string[]).includes(method)\n',
+     '  return true\n',
+     'private chat: a named exemption sends for the methods it covers and no other, and no argument an agent can pass is one'),
+    ('DM9', 'exemption must be a named row', 'private-chat.ts',
+     "  if (typeof name !== 'string' || !Object.hasOwn(PRIVATE_CHAT_EXEMPTIONS, name)) return false\n  return (",
+     "  if (typeof name !== 'string') return false\n  if (!Object.hasOwn(PRIVATE_CHAT_EXEMPTIONS, name)) return true\n  return (",
+     'private chat: a named exemption sends for the methods it covers and no other, and no argument an agent can pass is one'),
+    ('DM10', 'exemption: pairing confirm', 'server.ts',
+     '"Paired! Say hi to Claude.", exempt(\'pairing\')',
+     '"Paired! Say hi to Claude."',
+     'end to end, exemptions: pairing and the DM commands still answer in the DM'),
+    ('DM11', 'exemption: pairing code', 'server.ts',
+     "      exempt('pairing'),\n",
+     '',
+     'end to end, exemptions: pairing and the DM commands still answer in the DM'),
+    ('DM12', 'exemption: dm-command', 'server.ts',
+     "await ctx.reply(`Paired as ${name}.`, exempt('dm-command'))",
+     'await ctx.reply(`Paired as ${name}.`)',
+     'end to end, exemptions: pairing and the DM commands still answer in the DM'),
+    ('DM13', 'exemption: permission prompt', 'server.ts',
+     "{ reply_markup: keyboard, ...exempt('permission-relay') }).catch(e => {",
+     '{ reply_markup: keyboard }).catch(e => {',
+     'end to end, exemptions: a permission prompt goes to his DM, and his tap and his typed yes are marked there'),
+    ('DM14', 'exemption: permission mark', 'server.ts',
+     "      ], exempt('permission-relay')).catch(() => {})",
+     '      ]).catch(() => {})',
+     'end to end, exemptions: a permission prompt goes to his DM, and his tap and his typed yes are marked there'),
+    ('DM15', 'exemption: tap mark', 'server.ts',
+     "{ reply_markup: m as never, ...exempt('tap-answer') }",
+     '{ reply_markup: m as never }',
+     'end to end, exemptions: a tap in his DM is marked on the tapped message and an alert tap is answered under it'),
+    ('DM16', 'exemption: alert tap answer', 'server.ts',
+     "    ...exempt('tap-answer'),\n  })",
+     '  })',
+     'end to end, exemptions: a tap in his DM is marked on the tapped message and an alert tap is answered under it'),
+    ('DM17', 'exemption: pin release', 'server.ts',
+     "bot.api.unpinChatMessage(chat_id, message_id, exempt('pin-release'))",
+     'bot.api.unpinChatMessage(chat_id, message_id)',
+     'end to end, exemptions: a pin already standing in his DM comes down by unpin_message and by his reply'),
+    ('DM18', 'unpin_message has its own gate', 'pin.ts',
+     '  ;(deps.assertUnpinChat ?? deps.assertAllowedChat)(chat_id)\n',
+     '  deps.assertAllowedChat(chat_id)\n',
+     'private chat: unpin_message alone may name a DM (pin-release), and only an allowlisted one'),
+    ('DM19', 'exemption: wake-ack', 'wake-check.ts',
+     ", ...exempt('wake-ack') })",
+     ' })',
+     'wake check: a DM from allowFrom exits 10, leaves it pending, and posts the ack in its chat'),
 ]
 
 FAIL_RE = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)
@@ -1069,7 +1154,8 @@ def run_tests(d):
     # and once that passed the 64K pipe buffer bun's output arrived cut short,
     # without the "(fail)" line that names the test.
     with tempfile.TemporaryFile("w+") as f:
-        p = subprocess.run(["bun", "test"], cwd=d, stdout=f, stderr=subprocess.STDOUT, timeout=180)
+        p = subprocess.run(["bun", "test"] + os.environ.get("REVERT_PROOFS_FILES", "").split(),
+                           cwd=d, stdout=f, stderr=subprocess.STDOUT, timeout=420)
         f.seek(0)
         out = f.read()
     return p.returncode, FAIL_RE.findall(out), out

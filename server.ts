@@ -24,14 +24,15 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { Bot, GrammyError, InlineKeyboard, type Context } from 'grammy'
+import { Bot, GrammyError, InlineKeyboard, type Context, type Transformer } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep, basename } from 'path'
 import { tapToast, type TapOutcome } from './tap-toast.ts'
-import { runReply, runEditMessage } from './reply.ts'
+import { runReply, runEditMessage, runReact } from './reply.ts'
+import { assertOutboundChat, exempt, refusePrivateChat } from './private-chat.ts'
 import { makeTee, teeInbound, safeTee, outEntry, isGroupChatId, TEE_DIR } from './post-log.ts'
 import { planHuddle, runHuddleSection, runHuddleAnswer, type HuddleDeps, type HuddlePlan } from './huddle.ts'
 import { planGroupCommand, planMentionInvite, runGroupCommand, sayGroupCommand, runWho, spawnOutput, type CommandDeps, type CommandPlan, type CommandMessage } from './invite-excuse.ts'
@@ -131,6 +132,12 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const bot = new Bot(TOKEN, process.env.TELEGRAM_API_ROOT ? { client: { apiRoot: process.env.TELEGRAM_API_ROOT } } : {})
 let botUsername = ''
 
+// No post into a private chat (private-chat.ts). Installed on the bot's API so
+// it sees every call this bridge makes, the handlers' ctx calls included: a
+// send path nobody gated is refused, not allowed. The exemptions are named in
+// that file, and each call site that is one says which.
+bot.api.config.use(refusePrivateChat as Transformer)
+
 // The post log (spec item 1): every group post this bot sends or receives, one
 // JSON line each, in a file named for this bot. Local disk only; a failed write
 // is one stderr line and never touches the send.
@@ -173,6 +180,8 @@ const peerLimiter = new PeerLimiter()
 // (or a safety cap), so the sender sees a live "is composing" signal for the
 // whole turn. Scoped per chat_id and ONLY between inbound and reply, so it never
 // shows during autonomous/background work (which has no inbound to start it).
+// Never in a private chat: no reply can land there, and the API refuses the
+// chat action like any other post into one (private-chat.ts).
 const TYPING_EVERY_MS = 4_000
 const TYPING_MAX_MS = 4 * 60_000
 const typingTimers = new Map<string, { interval: ReturnType<typeof setInterval>; cap: ReturnType<typeof setTimeout> }>()
@@ -291,13 +300,16 @@ function loadAccess(): Access {
   return BOOT_ACCESS ?? readAccessFile()
 }
 
-// Outbound gate — reply/react/edit can only target chats the inbound gate
-// would deliver from. Telegram DM chat_id == user_id, so allowFrom covers DMs.
+// Outbound gate: a tool can post only into a group the inbound gate would
+// deliver from, and never into a private chat (private-chat.ts). A DM's
+// chat_id is the user's id, so allowFrom used to let every tool into his DM.
 function assertAllowedChat(chat_id: string): void {
-  const access = loadAccess()
-  if (access.allowFrom.includes(chat_id)) return
-  if (chat_id in access.groups) return
-  throw new Error(`chat ${chat_id} is not allowlisted — add via ${ACCESS_CMD} allow <user_id> or ${ACCESS_CMD} group-add <chat_id>`)
+  assertOutboundChat(loadAccess(), chat_id, ACCESS_CMD)
+}
+// unpin_message alone may name a private chat, under the 'pin-release'
+// exemption: it takes down a pin this bot already holds there.
+function assertUnpinChat(chat_id: string): void {
+  assertOutboundChat(loadAccess(), chat_id, ACCESS_CMD, 'pin-release')
 }
 
 function saveAccess(a: Access): void {
@@ -393,7 +405,7 @@ function checkApprovals(): void {
 
   for (const senderId of files) {
     const file = join(APPROVED_DIR, senderId)
-    void bot.api.sendMessage(senderId, "Paired! Say hi to Claude.").then(
+    void bot.api.sendMessage(senderId, "Paired! Say hi to Claude.", exempt('pairing')).then(
       () => rmSync(file, { force: true }),
       err => {
         process.stderr.write(`telegram channel: failed to send approval confirm: ${err}\n`)
@@ -426,7 +438,9 @@ const mcp = new Server(
       '',
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has a message_thread_id attribute, pass it back to reply into the same thread. It does NOT mean the chat is a forum: per the Bot API that field is the id of a message thread OR a forum topic, so an ordinary reply chain in any supergroup carries one. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses. When the sender replied to an earlier message, the tag carries reply_to (that message\'s id), reply_to_text (its first 300 characters, on one line) and reply_to_from (its author): that is the message they are answering.',
       '',
-      'The FIRST thing to do on an inbound message is call react with \u{1F440} on its message_id. That is the sender\'s only signal that a live agent has actually read it: nothing in the transport reacts on your behalf, by design, because a transport-level reaction cannot tell "an agent read this" apart from "the bot process is running." React first, then do the work.',
+      'Monty\'s DM is not a work channel. A message from a private chat (a positive chat_id) still reaches you, but reply, react, edit_message and pin_message are refused there. Do not react to it or answer it in the DM: answer in the FLEET topic where the work is, with that group\'s chat_id and the topic\'s message_thread_id.',
+      '',
+      'The FIRST thing to do on an inbound message in a group is call react with \u{1F440} on its message_id. That is the sender\'s only signal that a live agent has actually read it: nothing in the transport reacts on your behalf, by design, because a transport-level reaction cannot tell "an agent read this" apart from "the bot process is running." React first, then do the work.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -486,7 +500,7 @@ mcp.setNotificationHandler(
       .text('✅ Allow', `perm:allow:${request_id}`)
       .text('❌ Deny', `perm:deny:${request_id}`)
     for (const chat_id of access.allowFrom) {
-      void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
+      void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard, ...exempt('permission-relay') }).catch(e => {
         process.stderr.write(`permission_request send to ${chat_id} failed: ${e}\n`)
       })
     }
@@ -496,8 +510,15 @@ mcp.setNotificationHandler(
 // Pins (pin.ts): this session's own sends, and the pin record in the state dir.
 const sentPosts = new SentPosts()
 const pinDeps: PinDeps & SweepDeps = {
-  api: bot.api,
+  api: {
+    pinChatMessage: (chat_id, message_id, other) => bot.api.pinChatMessage(chat_id, message_id, other),
+    // Every unpin is the 'pin-release' exemption: the tool, his answer and the sweep.
+    unpinChatMessage: (chat_id, message_id) => bot.api.unpinChatMessage(chat_id, message_id, exempt('pin-release')),
+    getMe: () => bot.api.getMe(),
+    getChatMember: (chat_id, user_id) => bot.api.getChatMember(chat_id, user_id),
+  },
   assertAllowedChat,
+  assertUnpinChat,
   sent: sentPosts,
   store: filePinStore(join(STATE_DIR, 'pins.json')),
   stderr: s => process.stderr.write(s),
@@ -702,13 +723,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           { api: bot.api, loadAccess, assertAllowedChat, assertSendable, stopTyping, tee, relay, sent: p => sentPosts.note(p.chat_id, p.message_id, { text: p.text, thread_id: p.thread_id }) },
           args,
         )
-      case 'react': {
-        assertAllowedChat(args.chat_id as string)
-        await bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
-          { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
-        ])
-        return { content: [{ type: 'text', text: 'reacted' }] }
-      }
+      case 'react':
+        return await runReact({ api: bot.api, assertAllowedChat }, args)
       case 'download_attachment': {
         const file_id = args.file_id as string
         const file = await bot.api.getFile(file_id)
@@ -820,7 +836,8 @@ bot.command('start', async ctx => {
     `To pair:\n` +
     `1. DM me anything — you'll get a 6-char code\n` +
     `2. In a terminal: ${ACCESS_CMD} pair <code>\n\n` +
-    `After that, DMs here reach that session.`
+    `After that, DMs here reach that session.`,
+    exempt('dm-command'),
   )
 })
 
@@ -830,7 +847,8 @@ bot.command('help', async ctx => {
     `Messages you send here route to a paired Claude Code session. ` +
     `Text and photos are forwarded; replies and reactions come back.\n\n` +
     `/start — pairing instructions\n` +
-    `/status — check your pairing state`
+    `/status — check your pairing state`,
+    exempt('dm-command'),
   )
 })
 
@@ -841,20 +859,21 @@ bot.command('status', async ctx => {
 
   if (access.allowFrom.includes(senderId)) {
     const name = ctx.from!.username ? `@${ctx.from!.username}` : senderId
-    await ctx.reply(`Paired as ${name}.`)
+    await ctx.reply(`Paired as ${name}.`, exempt('dm-command'))
     return
   }
 
   for (const [code, p] of Object.entries(access.pending)) {
     if (p.senderId === senderId) {
       await ctx.reply(
-        `Pending pairing — run in a terminal:\n\n${ACCESS_CMD} pair ${code}`
+        `Pending pairing — run in a terminal:\n\n${ACCESS_CMD} pair ${code}`,
+        exempt('dm-command'),
       )
       return
     }
   }
 
-  await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
+  await ctx.reply(`Not paired. Send me a message to get a pairing code.`, exempt('dm-command'))
 })
 
 // Inline-button handler. Handles two classes of callback data:
@@ -866,7 +885,7 @@ bot.command('status', async ctx => {
 const omfTapDeps: OmfTapDeps = {
   run: spawnRunner,
   send: async (chat_id, text, thread_id) => {
-    const sent = await bot.api.sendMessage(chat_id, text, thread_id != null ? { message_thread_id: thread_id } : {})
+    const sent = await bot.api.sendMessage(chat_id, text, { ...(thread_id != null ? { message_thread_id: thread_id } : {}), ...exempt('tap-answer') })
     if (isGroupChatId(chat_id)) safeTee(tee, outEntry({ chat_id, thread_id, message_id: sent.message_id, text, edit: false }))
   },
   stderr: s => process.stderr.write(s),
@@ -878,6 +897,7 @@ const alertSend = async (chat_id: string, text: string, opts: { thread_id?: numb
   const sent = await bot.api.sendMessage(chat_id, text, {
     ...(opts.thread_id != null ? { message_thread_id: opts.thread_id } : {}),
     ...(opts.reply_to != null ? { reply_parameters: { message_id: opts.reply_to, allow_sending_without_reply: true } } : {}),
+    ...exempt('tap-answer'),
   })
   if (isGroupChatId(chat_id)) safeTee(tee, outEntry({ chat_id, thread_id: opts.thread_id, message_id: sent.message_id, reply_to: opts.reply_to, text, edit: false }))
   return sent
@@ -925,7 +945,7 @@ bot.on('callback_query:data', async ctx => {
     ? ctx.callbackQuery.message.reply_markup as Markup
     : undefined
   const markTap = () => markTapped(
-    { edit: m => ctx.editMessageReplyMarkup({ reply_markup: m as never }), stderr: s => process.stderr.write(s) },
+    { edit: m => ctx.editMessageReplyMarkup({ reply_markup: m as never, ...exempt('tap-answer') }), stderr: s => process.stderr.write(s) },
     tappedMarkup, data,
   )
   // A frozen button: the choice was made. Answered here, handed to nobody.
@@ -989,7 +1009,7 @@ bot.on('callback_query:data', async ctx => {
       const keyboard = new InlineKeyboard()
         .text('✅ Allow', `perm:allow:${request_id}`)
         .text('❌ Deny', `perm:deny:${request_id}`)
-      await ctx.editMessageText(expanded, { reply_markup: keyboard }).catch(() => {})
+      await ctx.editMessageText(expanded, { reply_markup: keyboard, ...exempt('permission-relay') }).catch(() => {})
       await ctx.answerCallbackQuery().catch(() => {})
       return
     }
@@ -1005,7 +1025,7 @@ bot.on('callback_query:data', async ctx => {
     // twice and the chat history shows what was chosen.
     const msg = ctx.callbackQuery.message
     if (msg && 'text' in msg && msg.text) {
-      await ctx.editMessageText(`${msg.text}\n\n${label}`).catch(() => {})
+      await ctx.editMessageText(`${msg.text}\n\n${label}`, exempt('permission-relay')).catch(() => {})
     }
     return
   }
@@ -1502,6 +1522,7 @@ async function handleInbound(
     const lead = result.isResend ? 'Still pending' : 'Pairing required'
     await ctx.reply(
       `${lead} — run in a terminal:\n\n${ACCESS_CMD} pair ${result.code}`,
+      exempt('pairing'),
     )
     return
   }
@@ -1530,7 +1551,7 @@ async function handleInbound(
       const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
       void bot.api.setMessageReaction(chat_id, msgId, [
         { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
-      ]).catch(() => {})
+      ], exempt('permission-relay')).catch(() => {})
     }
     return
   }
