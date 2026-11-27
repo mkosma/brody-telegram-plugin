@@ -98,6 +98,31 @@ After a tap the bridge edits the message's keyboard: the chosen button becomes "
 Inbound messages trigger a typing indicator automatically - Telegram shows
 "botname is typing…" while the assistant works on a response.
 
+## What a deploy changes without a restart
+
+The server does not import `outbound.ts` at launch. It loads it through `outbound-loader.ts`, which compares the file's mtime and size before each tool call and imports the file again when either changed. When nothing changed the cost is that one stat.
+
+**Live at the next tool call after the file changes on that host, with no restart:** everything in `outbound.ts`.
+
+- The private-chat gate: the refusal, its wording and the table of named exemptions.
+- Reference links: which references become links, the short repo names, and where nothing is linked.
+- The send path of `reply`, `react` and `edit_message`: the format, the chunks, the copy-button check, and what goes to the post log and the tag relay.
+
+`pin_message`, `unpin_message` and the forum-topic tools are not in that file, and the gate they call is, so a change to the gate is live for them too.
+
+**A bad deploy cannot silence a bot.** A version that does not import, or lacks a function the server calls (`OUTBOUND_EXPORTS`), is not taken. The bridge keeps sending with the last version that loaded and raises one `fleet-andon --severity P2 --owner Grady --key bridge-reload:<host>`, once and not once per call. The first good version to load resolves it. A bridge launched on a file that does not load still listens; its posting tools fail with the reason until a good file lands.
+
+**Still needs a restart, by construction:**
+
+- A new or renamed tool, or a changed tool description or schema (the tool list is in `server.ts`).
+- The MCP instructions text.
+- The inbound loop: the poll, the gates, the handlers, the commands, the taps and the reactions.
+- A call site in `server.ts` that takes a new exemption. The row in the table is live; the call that names it is not.
+- Every file other than `outbound.ts`, including the ones it imports (`post-log.ts`, `tag-relay.ts`) and the loader itself.
+- The channel flag and every context file (`CLAUDE.md`, `FLEET.md`, the charters), which a session reads at launch.
+
+Between tool calls a session keeps the version it last loaded: the bridge's own posts (a tap answer, a pairing reply) are checked by that version, and take the new one after the session's next tool call.
+
 ## Photos
 
 Inbound photos are downloaded to `~/.claude/channels/telegram/inbox/` and the

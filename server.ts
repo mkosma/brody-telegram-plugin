@@ -15,6 +15,7 @@
  *   - Pins: pin_message / unpin_message / list_pins, released on Monty's answer (pin.ts)
  *   - Copy buttons: copy_text on an inline button (outbound.ts)
  *   - Button state: a tapped button is marked in the message's keyboard (button-state.ts)
+ *   - Hot reload: the outbound rules are re-read from disk at each tool call (outbound-loader.ts)
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -31,9 +32,8 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, renameSync
 import { homedir } from 'os'
 import { join, sep, basename } from 'path'
 import { tapToast, type TapOutcome } from './tap-toast.ts'
-import { runReply, runEditMessage, runReact } from './outbound.ts'
-import { huddleLinksReader } from './outbound.ts'
-import { assertOutboundChat, exempt, refusePrivateChat } from './outbound.ts'
+import { outboundLoader, type Outbound } from './outbound-loader.ts'
+import type { PrivateChatExemption } from './outbound.ts'
 import { makeTee, teeInbound, safeTee, outEntry, isGroupChatId, TEE_DIR } from './post-log.ts'
 import { planHuddle, runHuddleSection, runHuddleAnswer, type HuddleDeps, type HuddlePlan } from './huddle.ts'
 import { planGroupCommand, planMentionInvite, runGroupCommand, sayGroupCommand, runWho, spawnOutput, type CommandDeps, type CommandPlan, type CommandMessage } from './invite-excuse.ts'
@@ -128,6 +128,30 @@ process.on('uncaughtException', err => {
 // 5 lowercase letters a-z minus 'l'. Case-insensitive for phone autocorrect.
 // Strict: no bare yes/no (conversational), no prefix/suffix chatter.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+
+// THE OUTBOUND RULES, BY REFERENCE (outbound-loader.ts). outbound.ts is not
+// imported here: the loader imports it, and again whenever the file changes,
+// so a deploy of it is live at the next tool call with no restart. Each name
+// below is the server's handle on the version loaded now, and the rest of
+// this file calls them as if they were imports.
+//
+// A file that does not load at launch leaves the bridge up and listening,
+// with the P2 raised: need() fails each tool that posts, with the reason, and
+// the first call after a good file lands loads it.
+const outbound = outboundLoader({ whose: ACCESS_AGENT === '<Agent>' ? undefined : `${ACCESS_AGENT}'s` })
+await outbound.fresh()
+const assertOutboundChat: Outbound['assertOutboundChat'] = (...a) => outbound.need().assertOutboundChat(...a)
+const runReply: Outbound['runReply'] = (...a) => outbound.need().runReply(...a)
+const runReact: Outbound['runReact'] = (...a) => outbound.need().runReact(...a)
+const runEditMessage: Outbound['runEditMessage'] = (...a) => outbound.need().runEditMessage(...a)
+const exempt = (name: PrivateChatExemption): Record<never, never> => outbound.current()?.exempt(name) ?? {}
+const refusePrivateChat: Transformer = (prev, method, payload, signal) => {
+  const rules = outbound.current()
+  if (rules) return rules.refusePrivateChat(prev, method, payload, signal)
+  // No version loaded: the poll and every read go on, and nothing is posted.
+  if (payload && 'chat_id' in payload && !method.startsWith('get')) throw new Error(`${method} refused: the bridge has no outbound rules loaded`)
+  return prev(method, payload, signal)
+}
 
 // TELEGRAM_API_ROOT is for tests only: it points the bot at a stub API.
 const bot = new Bot(TOKEN, process.env.TELEGRAM_API_ROOT ? { client: { apiRoot: process.env.TELEGRAM_API_ROOT } } : {})
@@ -717,12 +741,20 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }))
 
-// huddle's published links, read at each reply and edit (outbound.ts).
-const huddleLinks = huddleLinksReader()
+// huddle's published links, read at each reply and edit (outbound.ts). One
+// reader per loaded version, so its one read at a time holds across calls.
+let linksReader: { rules: Outbound; read: ReturnType<Outbound['huddleLinksReader']> } | undefined
+const huddleLinks = () => {
+  const rules = outbound.need()
+  if (linksReader?.rules !== rules) linksReader = { rules, read: rules.huddleLinksReader() }
+  return linksReader.read()
+}
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
+    // The outbound rules as they are on disk now: one stat when nothing changed.
+    await outbound.fresh()
     switch (req.params.name) {
       case 'reply':
         return await runReply(

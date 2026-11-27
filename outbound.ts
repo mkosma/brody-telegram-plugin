@@ -105,7 +105,10 @@ export const PRIVATE_CHAT_EXEMPTIONS = {
 
 export type PrivateChatExemption = keyof typeof PRIVATE_CHAT_EXEMPTIONS
 
-const EXEMPT = Symbol('private-chat-exemption')
+// Symbol.for, not Symbol: this file is loaded again when it changes
+// (outbound-loader.ts), and a mark made under one version must be read by the
+// next. It is still a symbol, so JSON still cannot carry it.
+const EXEMPT = Symbol.for('private-chat-exemption')
 
 /**
  * Spread into a call's `other` to mark it as one of the named exemptions:

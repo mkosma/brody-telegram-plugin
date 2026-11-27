@@ -30,6 +30,8 @@ Extended for DESIGN-bridge-refuses-bot-dms-2026-11-27 (ids DM*): no post into
 a private chat but a named exemption, in outbound.ts.
 Extended for DESIGN-bridge-links-references-2026-11-27 (ids LK*): reply and
 edit_message link his items and issue references, in outbound.ts.
+Extended for DESIGN-bridge-hot-reloads-outbound-rules-2026-11-27 (ids HR*):
+the server re-reads outbound.ts when it changes, in outbound-loader.ts.
 
 The baseline includes "presence D6", which loads Vera's who-hears from the
 agents repo and requires it to agree with the gate. To run against a copy of
@@ -1261,6 +1263,55 @@ REVERTS = [
      "Refer to Monty\\'s items as #47 and to issues as repo#123; the bridge links them. ",
      '',
      'end to end: the instructions and the reply tool say to write #47 and repo#123, and that the bridge links them'),
+    # DESIGN-bridge-hot-reloads-outbound-rules-2026-11-27
+    ('HR1', 'reload on change', 'outbound-loader.ts',
+     '    if (now !== seen) {',
+     '    if (seen === undefined) {',
+     'reload: a changed module takes effect on the next call, with no restart'),
+    ('HR2', 'no import when unchanged', 'outbound-loader.ts',
+     '    if (now !== seen) {',
+     '    if (true) {',
+     'reload: an unchanged module is not imported again, and each call costs one stat'),
+    ('HR3', 'the export check', 'outbound-loader.ts',
+     "        if (missing.length > 0) throw new Error(`it does not export ${missing.join(', ')}`)\n",
+     '',
+     'reload: a module missing an export keeps the old behavior and raises the P2 once'),
+    ('HR4', 'the last good version stays', 'outbound-loader.ts',
+     '      } catch (err) {\n        const why',
+     '      } catch (err) {\n        current = undefined\n        const why',
+     'reload: a module with a syntax error keeps the old behavior and raises the P2 once'),
+    ('HR5', 'the P2 is raised once', 'outbound-loader.ts',
+     '        if (!raised) {',
+     '        if (true) {',
+     'reload: a module with a syntax error keeps the old behavior and raises the P2 once'),
+    ('HR6', 'a good version resolves', 'outbound-loader.ts',
+     "          andon(['--key', key, '--resolve', '--owner', RELOAD_ALERT_OWNER])\n",
+     '',
+     'reload: a good module after a bad one is loaded and resolves the P2, once'),
+    ('HR7', 'it is a P2 to Grady', 'outbound-loader.ts',
+     "'--severity', 'P2', '--owner', RELOAD_ALERT_OWNER, '--key', key,",
+     "'--severity', 'P1', '--owner', RELOAD_ALERT_OWNER, '--key', key,",
+     'reload: a module with a syntax error keeps the old behavior and raises the P2 once'),
+    ('HR8', 'one reload at a time', 'outbound-loader.ts',
+     '      const next = queue.then(check)',
+     '      const next = check()',
+     'reload: calls that arrive during a reload all get the new version, from one import'),
+    ('HR9', 'a mark outlives a reload', 'outbound.ts',
+     "const EXEMPT = Symbol.for('private-chat-exemption')",
+     "const EXEMPT = Symbol('private-chat-exemption')",
+     'reload: an exemption marked under one version is honored by the next'),
+    ('HR10', 'each tool call looks at the disk', 'server.ts',
+     '    await outbound.fresh()\n    switch (req.params.name) {',
+     '    switch (req.params.name) {',
+     'end to end: the DM refusal and an issue link go live in a running bridge by the file change alone'),
+    ('HR11', 'nothing loaded posts nothing', 'server.ts',
+     "  if (payload && 'chat_id' in payload && !method.startsWith('get')) throw new Error(`${method} refused: the bridge has no outbound rules loaded`)\n",
+     '',
+     'end to end: a bridge launched on an outbound.ts that does not load still listens, posts nothing, says why, and sends from the first call after a good deploy'),
+    ('HR12', 'the alert is raised by fleet-andon', 'outbound-loader.ts',
+     "    const p = spawn(FLEET_ANDON_BIN, argv, { stdio: 'ignore', detached: true })",
+     "    const p = spawn('/usr/bin/true', argv, { stdio: 'ignore', detached: true })",
+     'end to end: a deploy with a syntax error, then one missing an export, keeps the bridge sending as before and raises one P2; a good deploy resolves it'),
 ]
 
 FAIL_RE = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$", re.M)
